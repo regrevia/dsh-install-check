@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { scanPackage } from '../lib/signature.js'
 import { compare } from '../lib/check.js'
 import { render } from '../lib/report.js'
-import { checkInstall } from '../index.js'
+import { checkInstall, apply } from '../index.js'
 
 const PATCH = ['- insert:', '    - id: alpha-memory', '      name: alpha-memory', ''].join('\n')
 
@@ -120,5 +120,88 @@ test('stays out of the way when the target is not a plugin', async () => {
 
 test('ignores calls that are not installs', async () => {
   assert.equal(await checkInstall({ name: 'plugin_manager', arguments: { action: 'list_plugins' } }), null)
-  assert.equal(await checkInstall({ name: 'read', arguments: { action: 'install_bundle', target: 'x' } }), null)
+  assert.equal(await checkInstall({ name: 'plugin_manager', arguments: { action: 'install_bundle', target: 'x' } }), null)
+})
+
+const GAMMA = {
+  manifest: {
+    name: 'gamma-memory',
+    version: '3.0.0',
+    dsh: { bundle: { patch: './cordis.patch.yml' } },
+  },
+  files: {
+    'cordis.patch.yml': ['- insert:', '    - id: gamma-memory', '      name: gamma-memory', ''].join('\n'),
+    'index.js': [
+      'export function apply(ctx) {',
+      "  ctx.tools.register(defineTool({ name: 'memory_save', description: 'same tool, nothing else' }))",
+      '}',
+      '',
+    ].join('\n'),
+  },
+}
+
+function fakeContext() {
+  const handlers = {}
+  return {
+    handlers,
+    on(event, handler) {
+      handlers[event] = handler
+    },
+    use() {},
+    effect() {},
+  }
+}
+
+async function profileWith(alpha) {
+  const root = await mkdtemp(join(tmpdir(), 'install-check-hook-'))
+  const profile = join(root, 'profile')
+  await mkdir(join(profile, 'node_modules'), { recursive: true })
+  await writeFile(join(profile, 'package.json'), JSON.stringify({ dsh: { profile: { bundles: ['alpha-memory'] } } }))
+  await cp(alpha, join(profile, 'node_modules', 'alpha-memory'), { recursive: true })
+  return profile
+}
+
+async function withProfile(profile, run) {
+  const before = process.env.DSH_PROFILE_DIR
+  process.env.DSH_PROFILE_DIR = profile
+  try {
+    return await run()
+  } finally {
+    if (before === undefined) delete process.env.DSH_PROFILE_DIR
+    else process.env.DSH_PROFILE_DIR = before
+  }
+}
+
+test('asks when the candidate would take over a row or service', async () => {
+  const { alpha, beta } = await workspace()
+  const profile = await profileWith(alpha)
+  const ctx = fakeContext()
+  apply(ctx)
+  const decision = await withProfile(profile, () =>
+    ctx.handlers['tools/pre-execute'](
+      { name: 'plugin_manager', arguments: { action: 'install_bundle', target: beta } },
+      async () => ({ kind: 'allow' }),
+    ),
+  )
+  assert.equal(decision.kind, 'ask')
+  assert.match(decision.reason, /alpha-memory/)
+})
+
+test('lets a tool-name overlap install and appends the note', async () => {
+  const { root, alpha } = await workspace()
+  const profile = await profileWith(alpha)
+  const gamma = await fixture(root, GAMMA)
+  const ctx = fakeContext()
+  apply(ctx)
+  const exec = { name: 'plugin_manager', arguments: { action: 'install_bundle', target: gamma } }
+  const allow = async () => ({ kind: 'accept', content: [{ type: 'text', text: 'installed' }] })
+
+  const before = await withProfile(profile, () => ctx.handlers['tools/pre-execute'](exec, allow))
+  assert.equal(before.kind, 'accept')
+
+  const after = await withProfile(profile, () =>
+    ctx.handlers['tools/post-execute'](exec, { isError: false, content: [] }, allow),
+  )
+  assert.equal(after.content.length, 2)
+  assert.match(after.content[1].text, /memory_save/)
 })

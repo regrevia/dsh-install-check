@@ -2,9 +2,14 @@
  * 插件无忧装 — 装之前看一眼。
  *
  * Hooks the install call itself, so nothing extra has to be asked first:
- * the model says "install X", this reads X, and if X would collide with or
- * depend on something, the user gets one sentence and one suggestion before
- * the install goes through.
+ * the model says "install X", this reads X, and answers with one sentence and
+ * one suggestion. Nothing is ever silently changed.
+ *
+ * Two moments:
+ *  - before install: a real takeover (same loader row or service key) asks
+ *    once; overlapping tools/routes/peers never stop the install.
+ *  - after install: the same findings are appended to the result, so the
+ *    model tells the user right away even when approvals are unavailable.
  */
 import { readFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
@@ -18,7 +23,8 @@ export const name = 'install-check'
 export const inject = ['tools']
 
 const CACHE_TTL = 60_000
-const cache = new Map()
+const scanCache = new Map()
+const pending = new Map()
 
 function profileDir() {
   const explicit = process.env.DSH_PROFILE_DIR
@@ -29,10 +35,10 @@ function profileDir() {
 }
 
 function scanCached(dir) {
-  const hit = cache.get(dir)
+  const hit = scanCache.get(dir)
   if (hit && Date.now() - hit.at < CACHE_TTL) return hit.signature
   const signature = scanPackage(dir)
-  cache.set(dir, { at: Date.now(), signature })
+  scanCache.set(dir, { at: Date.now(), signature })
   return signature
 }
 
@@ -110,12 +116,22 @@ export async function checkInstall(exec, options = {}) {
   }
 }
 
+function key(exec) {
+  const target = exec?.arguments?.target
+  return typeof target === 'string' ? target.trim() : ''
+}
+
 export function apply(ctx) {
   ctx.on('tools/pre-execute', async (exec, next) => {
     if (exec?.name !== 'plugin_manager') return next()
     try {
       const checked = await checkInstall(exec)
       if (!checked) return next()
+
+      if (checked.result.hard.length === 0) {
+        pending.set(key(exec), { checked, at: Date.now() })
+        return next()
+      }
       return {
         kind: 'ask',
         reason: checked.text.zh,
@@ -124,6 +140,21 @@ export function apply(ctx) {
     } catch {
       // A checker that cannot read the target must never block an install.
       return next()
+    }
+  })
+
+  ctx.on('tools/post-execute', async (exec, result, next) => {
+    const held = pending.get(key(exec))
+    if (!held) return next()
+    pending.delete(key(exec))
+
+    const decision = await next()
+    if (result?.isError || decision?.kind !== 'accept' || !decision.content) return decision
+    if (Date.now() - held.at > CACHE_TTL) return decision
+
+    return {
+      ...decision,
+      content: [...decision.content, { type: 'text', text: held.checked.text.zh }],
     }
   })
 }
