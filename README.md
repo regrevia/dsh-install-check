@@ -12,9 +12,9 @@ DSH 装插件前的自动体检。你说「装 X」，它先读 X 的代码，�
 
 装完立刻给结论，安装照常完成。真会打架的：
 
-> 冲突：和 dsh-lite-memory 撞了 memory_search，只能留一个。
+> 冲突：和 dsh-lite-memory 用同一个工具名 memory_search，两个只能留一个。
 >
-> 想用新装这个，先停用 dsh-lite-memory 再重启。
+> 两个都想要，先停用 dsh-lite-memory 再重启。
 
 少东西的：
 
