@@ -79,21 +79,25 @@ test('reports the exact keys that collide, plus missing peers', async () => {
   const result = compare(scanPackage(beta), [scanPackage(alpha)])
   const kinds = result.findings.map((finding) => finding.kind).sort()
   assert.deepEqual(kinds, ['peer', 'row', 'service', 'tool'])
-  assert.equal(result.hard.length, 2)
+  assert.equal(result.breaks.length, 3)
+  assert.equal(result.missing.length, 1)
   const tool = result.findings.find((finding) => finding.kind === 'tool')
   assert.deepEqual(tool.owners, ['alpha-memory'])
 })
 
-test('renders the collision and the post-install verdict', async () => {
+test('says what breaks and what to do about it', async () => {
   const { alpha, beta } = await workspace()
   const candidate = scanPackage(beta)
   const result = compare(candidate, [scanPackage(alpha)])
   const text = render(candidate, result)
-  assert.match(text.zh, /memory_save/)
-  assert.match(text.zh, /装好了，重启才生效/)
-  assert.match(text.zh, /停用 alpha-memory/)
-  assert.match(text.en, /installed/i)
-  assert.doesNotMatch(text.zh, /建议先/)
+  const zh = text.zh.split('\n')
+  assert.equal(zh.length, 3)
+  assert.match(zh[0], /^冲突：和 alpha-memory 撞了 /)
+  assert.match(zh[0], /只能留一个/)
+  assert.match(zh[1], /先停用 alpha-memory 再重启/)
+  assert.match(zh[2], /^缺 @scope\/ghost，装上它之前这个插件起不来。$/)
+  assert.match(text.en, /^Conflict:/)
+  assert.doesNotMatch(text.zh, /模型只会看到一个|都注册工具|服务，后装的会顶掉/)
 })
 
 test('reads a colliding target end to end', async () => {
@@ -122,7 +126,8 @@ test('stays out of the way when the target is not a plugin', async () => {
 
 test('ignores calls that are not installs', async () => {
   assert.equal(await checkInstall({ name: 'plugin_manager', arguments: { action: 'list_plugins' } }), null)
-  assert.equal(await checkInstall({ name: 'plugin_manager', arguments: { action: 'install_bundle', target: 'x' } }), null)
+  assert.equal(await checkInstall({ name: 'plugin_manager', arguments: { action: 'set_bundle', target: 'x', enabled: false } }), null)
+  assert.equal(await checkInstall({ name: 'plugin_manager', arguments: { action: 'remove_bundle', target: 'x' } }), null)
 })
 
 const GAMMA = {

@@ -10,19 +10,19 @@ DSH 装插件前的自动体检。你说「装 X」，它先读 X 的代码，�
 
 ## 它长什么样
 
-装完立刻说一句，安装照常完成：
+装完立刻给结论，安装照常完成。真会打架的：
 
-> 和 dsh-lite-memory 都注册工具 memory_save，模型只会看到一个。
+> 冲突：和 dsh-lite-memory 撞了 memory_search，只能留一个。
 >
-> 装好了，可以用；功能有重叠，坏不了。
+> 想用新装这个，先停用 dsh-lite-memory 再重启。
 
-真会顶掉别人的：
+少东西的：
 
-> 和 dsh-lite-memory 都提供 memoryStore 服务，后装的会顶掉它。
->
-> 装好了，重启才生效。想留原样就停用 dsh-lite-memory；留着它就用它顶掉 dsh-lite-memory。
+> 缺 some-sdk，装上它之前这个插件起不来。
 
-它从不拦安装。profile 本来就要重启才生效，这句提醒到达时插件还没跑起来，你有时间改主意。也没有开关：先问和装完说，效果一样，多一个设置项只是多一处要维护的东西。
+不打架就不说话。像不像、是不是同类，它不猜：两个记忆插件工具名不重，就能同时开着，不算冲突。
+
+它从不拦安装。profile 本来就要重启才生效，这句提醒到达时插件还没跑起来，你有时间改主意。也没有开关，先问和装完说效果一样。
 
 ## 它看什么
 
@@ -31,8 +31,9 @@ DSH 装插件前的自动体检。你说「装 X」，它先读 X 的代码，�
 - 加载行 id（`cordis.patch.yml`）
 - 服务键（`provide` / `ctx.set`）
 - 工具名（`defineTool` / `tools.register`）
-- 路由前缀、slot
 - 插件之间的 `peerDependencies` 没装
+
+只报这三样会打架的东西。路由和 slot 在这套宿主里是叠加的，读了也不报。
 
 ## 安装
 
@@ -54,7 +55,7 @@ dsh plugin install dsh-install-check
 ## 开发
 
 ```bash
-node --test test/
+node --test test/run.mjs
 node scripts/scan-market.mjs names.txt
 ```
 
