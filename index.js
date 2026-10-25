@@ -1,15 +1,13 @@
 /**
  * 插件无忧装 — 装之前看一眼。
  *
- * Hooks the install call itself, so nothing extra has to be asked first:
- * the model says "install X", this reads X, and answers with one sentence and
- * one suggestion. Nothing is ever silently changed.
+ * Purely call-triggered: it only listens for plugin_manager's install calls.
+ * It never guesses intent from what the user said.
  *
- * Two moments:
- *  - before install: a real takeover (same loader row or service key) asks
- *    once; overlapping tools/routes/peers never stop the install.
- *  - after install: the same findings are appended to the result, so the
- *    model tells the user right away even when approvals are unavailable.
+ * The profile applies changes at restart, so the note that arrives with the
+ * install result still lands before the plugin is live. That is why this
+ * never stops an install: asking first would only cost a round trip, and
+ * where approvals are unavailable an ask degrades into a refusal.
  */
 import { readFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
@@ -22,7 +20,7 @@ import { materialize } from './lib/materialize.js'
 export const name = 'install-check'
 export const inject = ['tools']
 
-const CACHE_TTL = 60_000
+const TTL = 60_000
 const scanCache = new Map()
 const pending = new Map()
 
@@ -36,7 +34,7 @@ function profileDir() {
 
 function scanCached(dir) {
   const hit = scanCache.get(dir)
-  if (hit && Date.now() - hit.at < CACHE_TTL) return hit.signature
+  if (hit && Date.now() - hit.at < TTL) return hit.signature
   const signature = scanPackage(dir)
   scanCache.set(dir, { at: Date.now(), signature })
   return signature
@@ -91,6 +89,11 @@ function parseArgs(exec) {
   return target ? { target, enable } : null
 }
 
+function key(exec) {
+  const target = exec?.arguments?.target
+  return typeof target === 'string' ? target.trim() : ''
+}
+
 export async function checkInstall(exec, options = {}) {
   if (exec?.name !== 'plugin_manager') return null
   const call = parseArgs(exec)
@@ -107,18 +110,12 @@ export async function checkInstall(exec, options = {}) {
     // plugin_manager rejects non-plugin specs on its own; don't add noise.
     if (!candidate.isPlugin) return null
 
-    const installed = installedPackages(profile)
-    const result = compare(candidate, installed)
+    const result = compare(candidate, installedPackages(profile))
     if (result.ok) return null
     return { candidate, result, text: render(candidate, result) }
   } finally {
     await cleanup()
   }
-}
-
-function key(exec) {
-  const target = exec?.arguments?.target
-  return typeof target === 'string' ? target.trim() : ''
 }
 
 export function apply(ctx) {
@@ -127,18 +124,10 @@ export function apply(ctx) {
     try {
       const checked = await checkInstall(exec)
       if (!checked) return next()
-
-      if (checked.result.hard.length === 0) {
-        pending.set(key(exec), { checked, at: Date.now() })
-        return next()
-      }
-      return {
-        kind: 'ask',
-        reason: checked.text.zh,
-        displayReason: { en: checked.text.en, zh: checked.text.zh, 'zh-CN': checked.text.zh },
-      }
+      pending.set(key(exec), { checked, at: Date.now() })
+      return next()
     } catch {
-      // A checker that cannot read the target must never block an install.
+      // A checker that cannot read the target must never touch the install.
       return next()
     }
   })
@@ -150,7 +139,7 @@ export function apply(ctx) {
 
     const decision = await next()
     if (result?.isError || decision?.kind !== 'accept' || !decision.content) return decision
-    if (Date.now() - held.at > CACHE_TTL) return decision
+    if (Date.now() - held.at > TTL) return decision
 
     return {
       ...decision,

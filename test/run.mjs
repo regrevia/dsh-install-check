@@ -84,17 +84,19 @@ test('reports the exact keys that collide, plus missing peers', async () => {
   assert.deepEqual(tool.owners, ['alpha-memory'])
 })
 
-test('renders two sentences and one suggestion', async () => {
+test('renders the collision and the post-install verdict', async () => {
   const { alpha, beta } = await workspace()
   const candidate = scanPackage(beta)
   const result = compare(candidate, [scanPackage(alpha)])
   const text = render(candidate, result)
   assert.match(text.zh, /memory_save/)
-  assert.match(text.zh, /建议先停用 alpha-memory/)
-  assert.match(text.en, /disable alpha-memory/i)
+  assert.match(text.zh, /装好了，重启才生效/)
+  assert.match(text.zh, /停用 alpha-memory/)
+  assert.match(text.en, /installed/i)
+  assert.doesNotMatch(text.zh, /建议先/)
 })
 
-test('install hook asks once when the candidate collides', async () => {
+test('reads a colliding target end to end', async () => {
   const { root, alpha, beta } = await workspace()
   const profile = join(root, 'profile')
   await mkdir(join(profile, 'node_modules'), { recursive: true })
@@ -172,19 +174,23 @@ async function withProfile(profile, run) {
   }
 }
 
-test('asks when the candidate would take over a row or service', async () => {
+test('never stops the install, notes the takeover afterwards', async () => {
   const { alpha, beta } = await workspace()
   const profile = await profileWith(alpha)
   const ctx = fakeContext()
   apply(ctx)
-  const decision = await withProfile(profile, () =>
-    ctx.handlers['tools/pre-execute'](
-      { name: 'plugin_manager', arguments: { action: 'install_bundle', target: beta } },
-      async () => ({ kind: 'allow' }),
-    ),
+  const exec = { name: 'plugin_manager', arguments: { action: 'install_bundle', target: beta } }
+  const allow = async () => ({ kind: 'accept', content: [{ type: 'text', text: 'installed' }] })
+
+  const before = await withProfile(profile, () => ctx.handlers['tools/pre-execute'](exec, allow))
+  assert.equal(before.kind, 'accept')
+
+  const after = await withProfile(profile, () =>
+    ctx.handlers['tools/post-execute'](exec, { isError: false, content: [] }, allow),
   )
-  assert.equal(decision.kind, 'ask')
-  assert.match(decision.reason, /alpha-memory/)
+  assert.equal(after.content.length, 2)
+  assert.match(after.content[1].text, /memoryStore/)
+  assert.match(after.content[1].text, /停用 alpha-memory/)
 })
 
 test('lets a tool-name overlap install and appends the note', async () => {
