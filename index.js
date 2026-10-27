@@ -130,25 +130,30 @@ async function versionAudit(ctx) {
   if (!version) return null
   const profile = profileDir()
   const file = join(profile, '.install-check-version.json')
-  let last = null
+  let state = null
   try {
-    last = JSON.parse(readFileSync(file, 'utf8'))?.version ?? null
+    state = JSON.parse(readFileSync(file, 'utf8'))
   } catch {
-    last = null
+    state = null
   }
-  if (last === version) return null
-  try {
-    writeFileSync(file, JSON.stringify({ version, at: new Date().toISOString() }))
-  } catch {
-    return null
-  }
+  const seen = state?.version === version ? state : null
+  // The range and the loader are remembered separately: a build that cannot
+  // read one of them must not stop the other from being reported later.
+  const needRange = !seen?.range
+  const needLoader = !seen?.loader
+  if (!needRange && !needLoader) return null
+
+  const live = inactive(ctx)
+  if (live === null && !needRange) return null
+
   const dirs = installedDirs(profile)
   const installed = new Set(dirs.map((dir) => basename(dir)))
+  const previous = typeof state?.version === 'string' ? state.version : null
   const stale = []
   // A declared range can only be compared once there is a previous version to
   // compare with; the loader needs no baseline, so a first sighting still reports
   // what is not running right now.
-  if (last) {
+  if (needRange && previous) {
     for (const dir of dirs) {
       const range = declaredRange(dir)
       if (!range) continue
@@ -156,15 +161,23 @@ async function versionAudit(ctx) {
       if (verdict === 'below' || verdict === 'above') stale.push(basename(dir))
     }
   }
-  const live = inactive(ctx) ?? { broken: [], waiting: [] }
   const mine = (name) => installed.has(name) && !stale.includes(name)
-  const broken = live.broken.filter(mine)
-  const waiting = live.waiting.filter((name) => mine(name) && !broken.includes(name))
+  const broken = live ? live.broken.filter(mine) : []
+  const waiting = live ? live.waiting.filter((name) => mine(name) && !broken.includes(name)) : []
 
   const lines = []
   if (stale.length) lines.push(renderVersionAudit(stale, version).zh)
   if (broken.length) lines.push(renderBroken(broken).zh)
   if (waiting.length) lines.push(renderUnconnected(waiting).zh)
+
+  try {
+    writeFileSync(
+      file,
+      JSON.stringify({ version, range: true, loader: live !== null, at: new Date().toISOString() }),
+    )
+  } catch {
+    return null
+  }
   return lines.length ? lines.join('\n') : null
 }
 

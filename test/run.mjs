@@ -605,3 +605,63 @@ test('checking a Git target never runs its prepare script', async () => {
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('a loader that is still moving is not called broken', async () => {
+  const { inactive } = await import('../lib/loader.js')
+  const entries = [
+    { options: { name: 'coming-up' }, fiber: { state: 1 } },
+    { options: { name: 'going-down' }, fiber: { state: 5 } },
+    { options: { name: 'no-fiber-row' } },
+    { options: { name: 'healthy' }, fiber: { state: 2 } },
+  ]
+  assert.deepEqual(inactive({ loader: { entries: () => entries } }), { broken: [], waiting: [] })
+})
+
+test('a build without a loader does not consume the first sighting', async () => {
+  const { existsSync } = await import('node:fs')
+  const { resetShellVersion } = await import('../lib/shell.js')
+  const { root, alpha } = await workspace()
+  const profile = await profileWith(alpha)
+  const state = join(profile, '.install-check-version.json')
+
+  const before = process.env.DSH_SHELL_VERSION
+  process.env.DSH_SHELL_VERSION = '0.2.2'
+  resetShellVersion()
+  try {
+    const blind = fakeContext()
+    apply(blind)
+    assert.equal(await postNote(profile, blind), 'ok')
+    assert.equal(JSON.parse(await readFile(state, 'utf8')).loader, false, 'an unreadable loader must not count as checked')
+
+    const seeing = fakeContext({
+      loader: { entries: () => [{ options: { name: 'alpha-memory' }, fiber: { state: 3 } }] },
+    })
+    apply(seeing)
+    assert.match(await postNote(profile, seeing), /升级后起不来：alpha-memory/)
+  } finally {
+    if (before === undefined) delete process.env.DSH_SHELL_VERSION
+    else process.env.DSH_SHELL_VERSION = before
+    resetShellVersion()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('declared ranges follow the host rules', async () => {
+  const { versionVerdict } = await import('../lib/compat.js')
+  const cases = [
+    ['1.9.0', '~1.2.3', 'above'],
+    ['1.3.0', '^1.2', 'ok'],
+    ['1.5.4', '1.2 - 1.5', 'ok'],
+    ['0.2.1', '^0.3', 'below'],
+    ['0.2.1', '^0.2.0', 'ok'],
+    ['0.3.0', '^0.2.0', 'above'],
+    ['1.2.3', '>=1.0.0 <2', 'ok'],
+    ['2.0.0', '>=1.0.0 <2', 'above'],
+    ['1.2.4', '1.2.3', 'above'],
+    ['1.3.0', '~1.2', 'above'],
+    ['0.2.1-rc.3', '^0.2.0', 'ok'],
+  ]
+  for (const [version, range, want] of cases) {
+    assert.equal(versionVerdict(version, range), want, `${version} vs ${range}`)
+  }
+})
