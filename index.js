@@ -14,9 +14,10 @@ import { basename, join } from 'node:path'
 import { homedir } from 'node:os'
 import { scanPackage } from './lib/signature.js'
 import { compare } from './lib/check.js'
-import { render, renderSkills, renderTakeover, renderVersion, renderVersionAudit } from './lib/report.js'
+import { render, renderSkills, renderTakeover, renderNotActive, renderVersion, renderVersionAudit } from './lib/report.js'
 import { versionVerdict } from './lib/compat.js'
 import { declaredRange, shellVersion } from './lib/shell.js'
+import { notActive } from './lib/loader.js'
 import { scanPackageClient } from './lib/client.js'
 import { materialize } from './lib/materialize.js'
 import { fingerprint, findSkillConflicts, scanSkills, skillRoots } from './lib/skills.js'
@@ -116,7 +117,12 @@ function installedPackages(profile) {
  * read again the first time the version changes, and only the ones the new
  * version actually leaves are named.
  */
-function versionAudit() {
+/**
+ * A harness update can leave installed plugins behind. Their declared range is
+ * read again the first time the version changes, and the loader is asked the
+ * same question, so a plugin that silently failed to come up is named too.
+ */
+async function versionAudit(ctx) {
   const version = shellVersion()
   if (!version) return null
   const profile = profileDir()
@@ -129,22 +135,28 @@ function versionAudit() {
   }
   if (last === version) return null
   try {
-    writeFileSync(file, JSON.stringify({ version }))
+    writeFileSync(file, JSON.stringify({ version, at: new Date().toISOString() }))
   } catch {
     return null
   }
   // First sighting on this machine: nothing has changed yet.
   if (!last) return null
 
-  const names = []
-  for (const dir of installedDirs(profile)) {
+  const dirs = installedDirs(profile)
+  const installed = new Set(dirs.map((dir) => basename(dir)))
+  const stale = []
+  for (const dir of dirs) {
     const range = declaredRange(dir)
     if (!range) continue
     const verdict = versionVerdict(version, range)
-    if (verdict === 'below' || verdict === 'above') names.push(basename(dir))
+    if (verdict === 'below' || verdict === 'above') stale.push(basename(dir))
   }
-  if (!names.length) return null
-  return renderVersionAudit(names, version).zh
+  const silent = (notActive(ctx) ?? []).filter((name) => installed.has(name) && !stale.includes(name))
+
+  const lines = []
+  if (stale.length) lines.push(renderVersionAudit(stale, version).zh)
+  if (silent.length) lines.push(renderNotActive(silent).zh)
+  return lines.length ? lines.join('\n') : null
 }
 
 function parseArgs(exec) {
@@ -241,7 +253,7 @@ export function apply(ctx) {
     const note = skillNote()
     if (note) texts.push(note)
     try {
-      const audit = versionAudit()
+      const audit = await versionAudit(ctx)
       if (audit) texts.push(audit)
     } catch {
       // A version note must never take down a tool result.

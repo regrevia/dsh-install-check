@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, writeFile, readFile, cp } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile, readFile, cp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { scanPackage } from '../lib/signature.js'
@@ -150,10 +150,11 @@ const GAMMA = {
   },
 }
 
-function fakeContext() {
+function fakeContext(extra = {}) {
   const handlers = {}
   return {
     handlers,
+    ...extra,
     on(event, handler) {
       handlers[event] = handler
     },
@@ -409,5 +410,51 @@ test('after a harness update, installed plugins left behind are named once', asy
     if (before === undefined) delete process.env.DSH_SHELL_VERSION
     else process.env.DSH_SHELL_VERSION = before
     resetShellVersion()
+  }
+})
+
+test('a plugin the loader never brought up is named after the update', async () => {
+  const { resetShellVersion } = await import('../lib/shell.js')
+  const { notActive } = await import('../lib/loader.js')
+  const { root, alpha } = await workspace()
+  const profile = await profileWith(alpha)
+  await writeFile(join(profile, '.install-check-version.json'), JSON.stringify({ version: '0.2.1-rc.3' }))
+
+  const entries = [
+    { options: { name: 'alpha-memory' }, fiber: { state: 0 } },
+    { options: { name: '@scope/down-and-out' }, fiber: { state: 3 } },
+    { options: { name: 'healthy' }, fiber: { state: 2 } },
+    { options: { name: 'off-by-choice' }, disabled: true },
+    { options: { name: 'never-loaded' } },
+  ]
+  assert.deepEqual(notActive({ loader: { entries: () => entries } }).sort(), [
+    'alpha-memory',
+    'down-and-out',
+    'never-loaded',
+  ])
+  assert.equal(notActive({}), null)
+
+  const before = process.env.DSH_SHELL_VERSION
+  process.env.DSH_SHELL_VERSION = '0.2.2'
+  resetShellVersion()
+  try {
+    const ctx = fakeContext({ loader: { entries: () => entries } })
+    apply(ctx)
+    const exec = { name: 'some_tool', arguments: {} }
+    const allow = async () => ({ kind: 'accept', content: [{ type: 'text', text: 'ok' }] })
+    const text = (
+      await withProfile(profile, () => ctx.handlers['tools/post-execute'](exec, { isError: false, content: [] }, allow))
+    ).content
+      .map((item) => item.text)
+      .join('\n')
+    assert.match(text, /升级后没起来/)
+    assert.match(text, /alpha-memory/)
+    assert.doesNotMatch(text, /down-and-out/)
+    assert.doesNotMatch(text, /healthy/)
+  } finally {
+    if (before === undefined) delete process.env.DSH_SHELL_VERSION
+    else process.env.DSH_SHELL_VERSION = before
+    resetShellVersion()
+    await rm(root, { recursive: true, force: true })
   }
 })
