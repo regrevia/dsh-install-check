@@ -774,3 +774,73 @@ test('an optional peer is not a missing dependency', async () => {
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('routes collide only on the same kind and path', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-route-'))
+  try {
+    const make = async (name, route) => {
+      const dir = join(root, name)
+      await mkdir(dir, { recursive: true })
+      await writeFile(join(dir, 'package.json'), JSON.stringify({ name, version: '1.0.0' }))
+      await writeFile(join(dir, 'index.js'), `export function apply(ctx) {\n  ctx.effect(() => ctx.webServer.register({\n    kind: '${route.kind}',\n    path: '${route.path}',\n    handler: () => {},\n  }))\n}\n`)
+      return scanPackage(dir)
+    }
+    const exact = await make('route-exact', { kind: 'exact', path: '/api/one' })
+    const prefix = await make('route-prefix', { kind: 'prefix', path: '/api/one' })
+    const same = await make('route-same', { kind: 'exact', path: '/api/one' })
+    assert.deepEqual(exact.routes, ['exact:/api/one'])
+    // One exact and one prefix route on the same path are two seats.
+    assert.equal(compare(prefix, [exact]).breaks.length, 0)
+    // Two exact routes on the same path are one seat claimed twice.
+    const result = compare(same, [exact])
+    assert.equal(result.breaks.length, 1)
+    assert.match(render(same, result).zh, /抢同一个地址.*\/api\/one/)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a shared tool name reads as an override, not a broken install', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-tool-'))
+  try {
+    const make = async (name, tool) => {
+      const dir = join(root, name)
+      await mkdir(dir, { recursive: true })
+      await writeFile(join(dir, 'package.json'), JSON.stringify({ name, version: '1.0.0' }))
+      await writeFile(join(dir, 'index.js'), `export function apply(ctx) {\n  ctx.tools.register(defineTool({ name: '${tool}', description: 'x' }))\n}\n`)
+      return scanPackage(dir)
+    }
+    const first = await make('tool-a', 'memory_save')
+    const second = await make('tool-b', 'memory_save')
+    const result = compare(second, [first])
+    assert.equal(result.breaks.length, 1)
+    assert.match(render(second, result).zh, /同名工具/)
+    assert.doesNotMatch(render(second, result).zh, /只能留一个/)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a block scalar description is still read', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'install-check-skills-'))
+  const root = join(home, '.agents', 'skills')
+  await skillDir(root, 'sheet-edit', `name: sheet-edit\ndescription: >\n  ${WORKBOOK}.\n  Use for any workbook work.`)
+  await skillDir(root, 'print-sheet', `name: print-sheet\ndescription: |\n  ${WORKBOOK_PDF}.\n  Use for any workbook work.`)
+
+  const skills = scanSkills(skillRoots(home))
+  assert.equal(skills.length, 2)
+  const conflicts = findSkillConflicts(skills)
+  assert.equal(conflicts.overlaps.length, 1)
+})
+
+test('two Chinese descriptions that answer the same requests overlap', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'install-check-skills-'))
+  const root = join(home, '.agents', 'skills')
+  await skillDir(root, 'zhoubao', 'name: zhoubao\ndescription: 生成每周销售报表，汇总各区域数据并导出图表。')
+  await skillDir(root, 'sales-chart', 'name: sales-chart\ndescription: 生成每周销售报表，汇总各区域数据并导出图表和明细页。')
+  await skillDir(root, 'salsa', 'name: salsa\ndescription: 记录萨尔萨舞排练的编排笔记。')
+
+  const conflicts = findSkillConflicts(scanSkills(skillRoots(home)))
+  assert.equal(conflicts.overlaps.length, 1)
+  assert.deepEqual([conflicts.overlaps[0].a, conflicts.overlaps[0].b].sort(), ['sales-chart', 'zhoubao'])
+})
