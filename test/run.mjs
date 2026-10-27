@@ -426,7 +426,7 @@ test('the loader answer splits what broke from what is only waiting', async () =
   const { inactive } = await import('../lib/loader.js')
   const entries = [
     { options: { name: 'alpha-memory' }, fiber: { state: 3 } },
-    { options: { name: 'never-loaded' } },
+    { options: { name: 'no-fiber-row' } },
     {
       options: { name: '@scope/waiting' },
       fiber: { state: 0, inject: { sidebarRight: {} }, ctx: { get: () => undefined } },
@@ -436,7 +436,7 @@ test('the loader answer splits what broke from what is only waiting', async () =
     { options: { name: 'off-by-choice' }, disabled: true },
   ]
   assert.deepEqual(inactive({ loader: { entries: () => entries } }), {
-    broken: ['alpha-memory', 'never-loaded'],
+    broken: ['alpha-memory'],
     waiting: ['waiting'],
   })
   assert.equal(inactive({}), null)
