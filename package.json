@@ -12,7 +12,10 @@
     "install-check"
   ],
   "license": "MIT",
-  "author": "regrevia",
+  "author": {
+    "name": "regrevia",
+    "url": "https://github.com/regrevia"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/regrevia/dsh-install-check.git"
@@ -39,5 +42,8 @@
   },
   "engines": {
     "dsh": ">=0.2.0-rc.1"
+  },
+  "bugs": {
+    "url": "https://github.com/regrevia/dsh-install-check/issues"
   }
 }
