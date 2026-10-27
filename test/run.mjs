@@ -513,3 +513,95 @@ test('a first sighting still reports what is not running, and an unchanged versi
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('the official default decision still gets the note', async () => {
+  const { root, alpha } = await workspace()
+  const profile = await profileWith(alpha)
+  const gamma = await fixture(root, GAMMA)
+  const ctx = fakeContext()
+  apply(ctx)
+  const exec = { name: 'plugin_manager', token: 'call-1', arguments: { action: 'install_bundle', target: gamma } }
+  // The host's own default: accept the original result, no content copied.
+  const accept = async () => ({ kind: 'accept' })
+  const original = [{ type: 'text', text: 'installed' }]
+
+  await withProfile(profile, () => ctx.handlers['tools/pre-execute'](exec, accept))
+  const after = await withProfile(profile, () =>
+    ctx.handlers['tools/post-execute'](exec, { isError: false, content: original }, accept),
+  )
+  assert.equal(after.content.length, 2)
+  assert.equal(after.content[0].text, 'installed')
+  assert.match(after.content[1].text, /memory_save/)
+})
+
+test('a reminder stays with its own call', async () => {
+  const { root, alpha } = await workspace()
+  const profile = await profileWith(alpha)
+  const gamma = await fixture(root, GAMMA)
+  const ctx = fakeContext()
+  apply(ctx)
+  const accept = async () => ({ kind: 'accept' })
+  const first = { name: 'plugin_manager', token: 'call-a', arguments: { action: 'install_bundle', target: gamma } }
+  // Another tool whose arguments happen to carry the same target.
+  const other = { name: 'read_file', token: 'call-b', arguments: { target: gamma } }
+
+  await withProfile(profile, () => ctx.handlers['tools/pre-execute'](first, accept))
+
+  const stray = await withProfile(profile, () =>
+    ctx.handlers['tools/post-execute'](other, { isError: false, content: [] }, accept),
+  )
+  assert.equal(stray.content, undefined)
+
+  const second = { name: 'plugin_manager', token: 'call-c', arguments: { action: 'install_bundle', target: gamma } }
+  await withProfile(profile, () => ctx.handlers['tools/pre-execute'](second, accept))
+  const own = await withProfile(profile, () =>
+    ctx.handlers['tools/post-execute'](first, { isError: false, content: [] }, accept),
+  )
+  assert.match(JSON.stringify(own.content), /memory_save/)
+})
+
+test('a decision that replaces the value is left alone', async () => {
+  const ctx = fakeContext()
+  apply(ctx)
+  const exec = { name: 'plugin_manager', token: 'call-v', arguments: { action: 'install_bundle', target: 'x' } }
+  const replace = async () => ({ kind: 'accept', value: { ok: true } })
+  const after = await ctx.handlers['tools/post-execute'](exec, { isError: false, content: [] }, replace)
+  assert.deepEqual(after, { kind: 'accept', value: { ok: true } })
+})
+
+test('checking a Git target never runs its prepare script', async () => {
+  const { execFile } = await import('node:child_process')
+  const { promisify } = await import('node:util')
+  const { existsSync } = await import('node:fs')
+  const { materialize } = await import('../lib/materialize.js')
+  const run = promisify(execFile)
+  const root = await mkdtemp(join(tmpdir(), 'install-check-git-'))
+  const marker = join(root, 'prepare-ran')
+  await writeFile(
+    join(root, 'package.json'),
+    JSON.stringify({
+      name: 'candidate',
+      version: '1.0.0',
+      scripts: { prepare: "node -e \"require('fs').writeFileSync('prepare-ran','x')\"" },
+    }),
+  )
+  await writeFile(join(root, 'index.js'), 'export const x = 1\n')
+  try {
+    try {
+      await run('git', ['init', '-q'], { cwd: root })
+    } catch {
+      return // no git on this machine: nothing to prove here
+    }
+    await run('git', ['add', '-A'], { cwd: root })
+    await run('git', ['-c', 'user.email=a@b', '-c', 'user.name=a', 'commit', '-qm', 'init'], { cwd: root })
+    const packed = await materialize(`git+file://${root}`, { timeoutMs: 60000 })
+    try {
+      assert.equal(existsSync(marker), false, 'the candidate build script ran during a read-only check')
+      assert.ok(existsSync(join(packed.dir, 'package.json')), 'the packed candidate could not be read')
+    } finally {
+      await packed.cleanup()
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})

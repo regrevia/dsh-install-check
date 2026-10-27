@@ -33,7 +33,7 @@ import { fingerprint, findSkillConflicts, scanSkills, skillRoots } from './lib/s
 export const name = 'install-check'
 export const inject = ['tools']
 
-const TTL = 60_000
+const TTL = 30 * 60_000
 const SKILL_TTL = 3_000
 const scanCache = new Map()
 const pending = new Map()
@@ -178,9 +178,24 @@ function parseArgs(exec) {
   return target ? { target, enable } : null
 }
 
+/**
+ * One call, one reminder. The host hands each dispatch a distinct token (and a
+ * call id); the target is only a fallback for callers that pass neither, since
+ * two sessions installing the same spec would otherwise share one entry.
+ */
 function key(exec) {
+  const token = exec?.token ?? exec?.callId
+  if (typeof token === 'string' && token) return token
+  if (typeof token === 'symbol') return token
   const target = exec?.arguments?.target
-  return typeof target === 'string' ? target.trim() : ''
+  return typeof target === 'string' && target.trim() ? `target:${target.trim()}` : null
+}
+
+/** Entries whose call never came back must not pile up. */
+function sweep(now) {
+  for (const [k, held] of pending) {
+    if (now - held.at > TTL) pending.delete(k)
+  }
 }
 
 /** Test seam: forget what has been reported so a fixture home can be checked. */
@@ -242,7 +257,11 @@ export function apply(ctx) {
     try {
       const checked = await checkInstall(exec)
       if (!checked) return next()
-      pending.set(key(exec), { checked, at: Date.now() })
+      const slot = key(exec)
+      if (slot !== null) {
+        sweep(Date.now())
+        pending.set(slot, { checked, at: Date.now() })
+      }
       return next()
     } catch {
       // A checker that cannot read the target must never touch the install.
@@ -251,14 +270,19 @@ export function apply(ctx) {
   })
 
   ctx.on('tools/post-execute', async (exec, result, next) => {
-    const held = pending.get(key(exec))
-    if (held) pending.delete(key(exec))
+    const slot = key(exec)
+    const held = slot === null ? undefined : pending.get(slot)
+    if (slot !== null) pending.delete(slot)
 
     const decision = await next()
-    if (result?.isError || decision?.kind !== 'accept' || !decision.content) return decision
+    if (result?.isError || decision?.kind !== 'accept') return decision
+    // Replacing the value rebuilds the content, so text cannot ride along.
+    if (Object.hasOwn(decision, 'value')) return decision
+    const base = Array.isArray(decision.content) ? decision.content : result?.content
+    if (!Array.isArray(base)) return decision
 
     const texts = []
-    if (held && Date.now() - held.at <= TTL) texts.push(held.checked.text.zh)
+    if (held) texts.push(held.checked.text.zh)
     const note = skillNote()
     if (note) texts.push(note)
     try {
@@ -271,7 +295,7 @@ export function apply(ctx) {
 
     return {
       ...decision,
-      content: [...decision.content, ...texts.map((text) => ({ type: 'text', text }))],
+      content: [...base, ...texts.map((text) => ({ type: 'text', text }))],
     }
   })
 }
