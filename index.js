@@ -14,10 +14,18 @@ import { basename, join } from 'node:path'
 import { homedir } from 'node:os'
 import { scanPackage } from './lib/signature.js'
 import { compare } from './lib/check.js'
-import { render, renderSkills, renderTakeover, renderNotActive, renderVersion, renderVersionAudit } from './lib/report.js'
+import {
+  render,
+  renderBroken,
+  renderSkills,
+  renderTakeover,
+  renderUnconnected,
+  renderVersion,
+  renderVersionAudit,
+} from './lib/report.js'
 import { versionVerdict } from './lib/compat.js'
 import { declaredRange, shellVersion } from './lib/shell.js'
-import { notActive } from './lib/loader.js'
+import { inactive } from './lib/loader.js'
 import { scanPackageClient } from './lib/client.js'
 import { materialize } from './lib/materialize.js'
 import { fingerprint, findSkillConflicts, scanSkills, skillRoots } from './lib/skills.js'
@@ -113,11 +121,6 @@ function installedPackages(profile) {
 }
 
 /**
- * A harness update can leave installed plugins behind: their declared range is
- * read again the first time the version changes, and only the ones the new
- * version actually leaves are named.
- */
-/**
  * A harness update can leave installed plugins behind. Their declared range is
  * read again the first time the version changes, and the loader is asked the
  * same question, so a plugin that silently failed to come up is named too.
@@ -139,23 +142,29 @@ async function versionAudit(ctx) {
   } catch {
     return null
   }
-  // First sighting on this machine: nothing has changed yet.
-  if (!last) return null
-
   const dirs = installedDirs(profile)
   const installed = new Set(dirs.map((dir) => basename(dir)))
   const stale = []
-  for (const dir of dirs) {
-    const range = declaredRange(dir)
-    if (!range) continue
-    const verdict = versionVerdict(version, range)
-    if (verdict === 'below' || verdict === 'above') stale.push(basename(dir))
+  // A declared range can only be compared once there is a previous version to
+  // compare with; the loader needs no baseline, so a first sighting still reports
+  // what is not running right now.
+  if (last) {
+    for (const dir of dirs) {
+      const range = declaredRange(dir)
+      if (!range) continue
+      const verdict = versionVerdict(version, range)
+      if (verdict === 'below' || verdict === 'above') stale.push(basename(dir))
+    }
   }
-  const silent = (notActive(ctx) ?? []).filter((name) => installed.has(name) && !stale.includes(name))
+  const live = inactive(ctx) ?? { broken: [], waiting: [] }
+  const mine = (name) => installed.has(name) && !stale.includes(name)
+  const broken = live.broken.filter(mine)
+  const waiting = live.waiting.filter((name) => mine(name) && !broken.includes(name))
 
   const lines = []
   if (stale.length) lines.push(renderVersionAudit(stale, version).zh)
-  if (silent.length) lines.push(renderNotActive(silent).zh)
+  if (broken.length) lines.push(renderBroken(broken).zh)
+  if (waiting.length) lines.push(renderUnconnected(waiting).zh)
   return lines.length ? lines.join('\n') : null
 }
 

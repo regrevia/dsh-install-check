@@ -413,44 +413,99 @@ test('after a harness update, installed plugins left behind are named once', asy
   }
 })
 
-test('a plugin the loader never brought up is named after the update', async () => {
+async function postNote(profile, ctx) {
+  return withProfile(profile, async () => {
+    const exec = { name: 'some_tool', arguments: {} }
+    const allow = async () => ({ kind: 'accept', content: [{ type: 'text', text: 'ok' }] })
+    const decision = await ctx.handlers['tools/post-execute'](exec, { isError: false, content: [] }, allow)
+    return decision.content.map((item) => item.text).join('\n')
+  })
+}
+
+test('the loader answer splits what broke from what is only waiting', async () => {
+  const { inactive } = await import('../lib/loader.js')
+  const entries = [
+    { options: { name: 'alpha-memory' }, fiber: { state: 3 } },
+    { options: { name: 'never-loaded' } },
+    {
+      options: { name: '@scope/waiting' },
+      fiber: { state: 0, inject: { sidebarRight: {} }, ctx: { get: () => undefined } },
+    },
+    { options: { name: 'fine' }, fiber: { state: 0, inject: { tools: {} }, ctx: { get: () => ({}) } } },
+    { options: { name: 'healthy' }, fiber: { state: 2 } },
+    { options: { name: 'off-by-choice' }, disabled: true },
+  ]
+  assert.deepEqual(inactive({ loader: { entries: () => entries } }), {
+    broken: ['alpha-memory', 'never-loaded'],
+    waiting: ['waiting'],
+  })
+  assert.equal(inactive({}), null)
+})
+
+test('an update names what broke, and says apart what only lost a dependency', async () => {
   const { resetShellVersion } = await import('../lib/shell.js')
-  const { notActive } = await import('../lib/loader.js')
   const { root, alpha } = await workspace()
   const profile = await profileWith(alpha)
   await writeFile(join(profile, '.install-check-version.json'), JSON.stringify({ version: '0.2.1-rc.3' }))
-
-  const entries = [
-    { options: { name: 'alpha-memory' }, fiber: { state: 0 } },
-    { options: { name: '@scope/down-and-out' }, fiber: { state: 3 } },
-    { options: { name: 'healthy' }, fiber: { state: 2 } },
-    { options: { name: 'off-by-choice' }, disabled: true },
-    { options: { name: 'never-loaded' } },
-  ]
-  assert.deepEqual(notActive({ loader: { entries: () => entries } }).sort(), [
-    'alpha-memory',
-    'down-and-out',
-    'never-loaded',
-  ])
-  assert.equal(notActive({}), null)
+  await mkdir(join(profile, 'node_modules', 'waiting-dep'), { recursive: true })
+  await writeFile(
+    join(profile, 'node_modules', 'waiting-dep', 'package.json'),
+    JSON.stringify({ name: 'waiting-dep', version: '1.0.0' }),
+  )
+  await writeFile(
+    join(profile, 'package.json'),
+    JSON.stringify({ dsh: { profile: { bundles: ['alpha-memory', 'waiting-dep'] } } }),
+  )
 
   const before = process.env.DSH_SHELL_VERSION
   process.env.DSH_SHELL_VERSION = '0.2.2'
   resetShellVersion()
   try {
-    const ctx = fakeContext({ loader: { entries: () => entries } })
+    const ctx = fakeContext({
+      loader: {
+        entries: () => [
+          { options: { name: 'alpha-memory' }, fiber: { state: 3 } },
+          {
+            options: { name: 'waiting-dep' },
+            fiber: { state: 0, inject: { sidebarRight: {} }, ctx: { get: () => undefined } },
+          },
+          { options: { name: 'not-installed' }, fiber: { state: 3 } },
+        ],
+      },
+    })
     apply(ctx)
-    const exec = { name: 'some_tool', arguments: {} }
-    const allow = async () => ({ kind: 'accept', content: [{ type: 'text', text: 'ok' }] })
-    const text = (
-      await withProfile(profile, () => ctx.handlers['tools/post-execute'](exec, { isError: false, content: [] }, allow))
-    ).content
-      .map((item) => item.text)
-      .join('\n')
-    assert.match(text, /升级后没起来/)
-    assert.match(text, /alpha-memory/)
-    assert.doesNotMatch(text, /down-and-out/)
-    assert.doesNotMatch(text, /healthy/)
+    const text = await postNote(profile, ctx)
+    assert.match(text, /升级后起不来：alpha-memory/)
+    assert.match(text, /升级后没接上：waiting-dep/)
+    assert.doesNotMatch(text, /not-installed/)
+  } finally {
+    if (before === undefined) delete process.env.DSH_SHELL_VERSION
+    else process.env.DSH_SHELL_VERSION = before
+    resetShellVersion()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a first sighting still reports what is not running, and an unchanged version stays quiet', async () => {
+  const { resetShellVersion } = await import('../lib/shell.js')
+  const { root, alpha } = await workspace()
+  const profile = await profileWith(alpha)
+
+  const before = process.env.DSH_SHELL_VERSION
+  process.env.DSH_SHELL_VERSION = '0.2.2'
+  resetShellVersion()
+  try {
+    const ctx = fakeContext({
+      loader: { entries: () => [{ options: { name: 'alpha-memory' }, fiber: { state: 3 } }] },
+    })
+    apply(ctx)
+    assert.match(await postNote(profile, ctx), /升级后起不来：alpha-memory/)
+
+    const quiet = fakeContext({
+      loader: { entries: () => [{ options: { name: 'alpha-memory' }, fiber: { state: 3 } }] },
+    })
+    apply(quiet)
+    assert.equal(await postNote(profile, quiet), 'ok')
   } finally {
     if (before === undefined) delete process.env.DSH_SHELL_VERSION
     else process.env.DSH_SHELL_VERSION = before
