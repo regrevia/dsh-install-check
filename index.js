@@ -14,7 +14,8 @@ import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { scanPackage } from './lib/signature.js'
 import { compare } from './lib/check.js'
-import { render, renderSkills } from './lib/report.js'
+import { render, renderSkills, renderTakeover } from './lib/report.js'
+import { scanPackageClient } from './lib/client.js'
 import { materialize } from './lib/materialize.js'
 import { fingerprint, findSkillConflicts, scanSkills, skillRoots } from './lib/skills.js'
 
@@ -143,8 +144,22 @@ export async function checkInstall(exec, options = {}) {
     if (!candidate.isPlugin) return null
 
     const result = compare(candidate, installedPackages(profile))
-    if (result.ok) return null
-    return { candidate, result, text: render(candidate, result) }
+    // No shared name, no missing dependency — and still able to eat the window.
+    const takeover = scanPackageClient(dir)
+    const zh = []
+    const en = []
+    if (!result.ok) {
+      const note = render(candidate, result)
+      zh.push(note.zh)
+      en.push(note.en)
+    }
+    if (takeover) {
+      const risk = renderTakeover()
+      zh.push(risk.zh)
+      en.push(risk.en)
+    }
+    if (!zh.length) return null
+    return { candidate, result, text: { zh: zh.join('\n'), en: en.join('\n') } }
   } finally {
     await cleanup()
   }

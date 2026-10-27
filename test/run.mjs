@@ -8,6 +8,8 @@ import { compare } from '../lib/check.js'
 import { render } from '../lib/report.js'
 import { scanSkills, findSkillConflicts, skillRoots } from '../lib/skills.js'
 import { renderSkills } from '../lib/report.js'
+import { scanPackageClient } from '../lib/client.js'
+import { renderTakeover } from '../lib/report.js'
 import { checkInstall, apply, resetSkillWatch } from '../index.js'
 
 const PATCH = ['- insert:', '    - id: alpha-memory', '      name: alpha-memory', ''].join('\n')
@@ -307,4 +309,37 @@ test('a dropped skill folder gets one note on the next tool result', async () =>
     else process.env.INSTALL_CHECK_HOME = before
     resetSkillWatch()
   }
+})
+
+async function clientPackage(client) {
+  const dir = await mkdtemp(join(tmpdir(), 'install-check-client-'))
+  await writeFile(join(dir, 'package.json'), JSON.stringify({
+    name: 'task-graph-like',
+    version: '0.1.0',
+    exports: { './client': './client.js' },
+    dsh: { client: { inject: [], platform: 'web' } },
+  }))
+  await writeFile(join(dir, 'client.js'), client)
+  return dir
+}
+
+test('a plugin that fills a guessed host container is flagged', async () => {
+  const dir = await clientPackage([
+    "const host = document.querySelector('[class*=\"centerCol\"]') ?? document.body",
+    "const css = '.v{position:fixed;inset:0;z-index:200}'",
+    'host.appendChild(view)',
+    '',
+  ].join('\n'))
+  const hit = scanPackageClient(dir)
+  assert.equal(hit?.pane, 'host')
+  assert.match(renderTakeover().zh, /铺满全屏/)
+})
+
+test('a plugin that renders into a slot stays quiet', async () => {
+  const dir = await clientPackage([
+    "const css = '.v{position:absolute;inset:0}'",
+    'ctx.slot.register("sidebar.right.pane.tab", () => view)',
+    '',
+  ].join('\n'))
+  assert.equal(scanPackageClient(dir), null)
 })
