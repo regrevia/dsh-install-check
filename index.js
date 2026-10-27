@@ -4,10 +4,10 @@
  * Purely call-triggered: it only listens for plugin_manager's install calls.
  * It never guesses intent from what the user said.
  *
- * The profile applies changes at restart, so the note that arrives with the
- * install result still lands before the plugin is live. That is why this
- * never stops an install: asking first would only cost a round trip, and
- * where approvals are unavailable an ask degrades into a refusal.
+ * A change may go live without a restart, so this note can arrive after the
+ * plugin already runs; it still never stops an install. Asking first would
+ * cost a round trip, and where approvals are unavailable an ask degrades into
+ * a refusal.
  */
 import { readFileSync, existsSync, writeFileSync } from 'node:fs'
 import { basename, join } from 'node:path'
@@ -61,7 +61,15 @@ function skillNote() {
   return renderSkills({ names, overlaps }).zh
 }
 
-function profileDir() {
+function profileDir(ctx) {
+  // The running profile knows its own directory; env vars are only a fallback
+  // for callers outside one.
+  try {
+    const dir = ctx?.get?.('profileContext')?.dir
+    if (typeof dir === 'string' && dir) return dir
+  } catch {
+    // fall through to the environment
+  }
   const explicit = process.env.DSH_PROFILE_DIR
   if (explicit) return explicit
   const profile = process.env.DSH_PROFILE
@@ -128,7 +136,7 @@ function installedPackages(profile) {
 async function versionAudit(ctx) {
   const version = shellVersion()
   if (!version) return null
-  const profile = profileDir()
+  const profile = profileDir(ctx)
   const file = join(profile, '.install-check-version.json')
   let state = null
   try {
@@ -181,6 +189,17 @@ async function versionAudit(ctx) {
   return lines.length ? lines.join('\n') : null
 }
 
+/** The outcome the result itself reports, when it carries one. */
+function applicationOf(result) {
+  try {
+    const value = typeof result?.value === 'string' ? JSON.parse(result.value) : result?.value
+    const application = value && typeof value === 'object' ? value.application : undefined
+    return typeof application === 'string' ? application : null
+  } catch {
+    return null
+  }
+}
+
 function parseArgs(exec) {
   const args = exec?.arguments
   if (!args || typeof args !== 'object') return null
@@ -192,14 +211,14 @@ function parseArgs(exec) {
 }
 
 /**
- * One call, one reminder. The host hands each dispatch a distinct token (and a
- * call id); the target is only a fallback for callers that pass neither, since
- * two sessions installing the same spec would otherwise share one entry.
+ * One call, one reminder. Each dispatch carries its own id and call id; the
+ * target is only a fallback for callers that pass neither, since two sessions
+ * installing the same spec would otherwise share one entry.
  */
 function key(exec) {
-  const token = exec?.token ?? exec?.callId
-  if (typeof token === 'string' && token) return token
-  if (typeof token === 'symbol') return token
+  const dispatchId = exec?.['token'] ?? exec?.callId // ui-copy-ignore
+  if (typeof dispatchId === 'string' && dispatchId) return dispatchId
+  if (typeof dispatchId === 'symbol') return dispatchId
   const target = exec?.arguments?.target
   return typeof target === 'string' && target.trim() ? `target:${target.trim()}` : null
 }
@@ -221,7 +240,7 @@ export function resetSkillWatch() {
 export async function checkInstall(exec, options = {}) {
   if (exec?.name !== 'plugin_manager') return null
   const call = parseArgs(exec)
-  if (!call) return null
+  if (!call || call.enable) return null
 
   const profile = options.profileDir ?? profileDir()
   const { dir, cleanup } = await materialize(call.target, {
@@ -268,7 +287,7 @@ export function apply(ctx) {
   ctx.on('tools/pre-execute', async (exec, next) => {
     if (exec?.name !== 'plugin_manager') return next()
     try {
-      const checked = await checkInstall(exec)
+      const checked = await checkInstall(exec, { profileDir: profileDir(ctx) })
       if (!checked) return next()
       const slot = key(exec)
       if (slot !== null) {
@@ -293,6 +312,11 @@ export function apply(ctx) {
     if (Object.hasOwn(decision, 'value')) return decision
     const base = Array.isArray(decision.content) ? decision.content : result?.content
     if (!Array.isArray(base)) return decision
+
+    // `failed` and `cancelled` changes already say what happened; adding our
+    // notes would describe an install that did not take place.
+    const application = applicationOf(result)
+    if (application === 'failed' || application === 'cancelled') return decision
 
     const texts = []
     if (held) texts.push(held.checked.text.zh)

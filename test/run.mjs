@@ -665,3 +665,56 @@ test('declared ranges follow the host rules', async () => {
     assert.equal(versionVerdict(version, range), want, `${version} vs ${range}`)
   }
 })
+
+test('a change the host refused gets no advice about it', async () => {
+  const { root, alpha } = await workspace()
+  const profile = await profileWith(alpha)
+  const gamma = await fixture(root, GAMMA)
+  const ctx = fakeContext()
+  apply(ctx)
+  const exec = { name: 'plugin_manager', token: 'call-refused', arguments: { action: 'install_bundle', target: gamma } }
+  const accept = async () => ({ kind: 'accept', content: [{ type: 'text', text: 'failed' }] })
+  await withProfile(profile, () => ctx.handlers['tools/pre-execute'](exec, accept))
+  const result = { isError: false, content: [{ type: 'text', text: 'failed' }], value: JSON.stringify({ application: 'failed' }) }
+  const after = await withProfile(profile, () => ctx.handlers['tools/post-execute'](exec, result, accept))
+  assert.deepEqual(after.content, [{ type: 'text', text: 'failed' }])
+
+  const kept = { name: 'plugin_manager', token: 'call-kept', arguments: { action: 'install_bundle', target: gamma } }
+  await withProfile(profile, () => ctx.handlers['tools/pre-execute'](kept, accept))
+  const applied = { isError: false, content: [{ type: 'text', text: 'installed' }], value: JSON.stringify({ application: 'applied' }) }
+  const withNote = await withProfile(profile, () => ctx.handlers['tools/post-execute'](kept, applied, accept))
+  assert.equal(withNote.content.length, 2)
+  assert.match(withNote.content[1].text, /memory_save/)
+})
+
+test('the profile the host launched wins over the environment', async () => {
+  const { existsSync } = await import('node:fs')
+  const { resetShellVersion } = await import('../lib/shell.js')
+  const { root, alpha } = await workspace()
+  const profile = await profileWith(alpha)
+  const elsewhere = join(root, 'elsewhere')
+  await mkdir(elsewhere, { recursive: true })
+
+  const before = process.env.DSH_SHELL_VERSION
+  const beforeDir = process.env.DSH_PROFILE_DIR
+  process.env.DSH_SHELL_VERSION = '0.2.2'
+  process.env.DSH_PROFILE_DIR = elsewhere
+  resetShellVersion()
+  try {
+    const ctx = fakeContext({
+      get: (name) => (name === 'profileContext' ? { dir: profile } : undefined),
+      loader: { entries: () => [{ options: { name: 'alpha-memory' }, fiber: { state: 3 } }] },
+    })
+    apply(ctx)
+    assert.match(await postNote(profile, ctx), /升级后起不来：alpha-memory/)
+    assert.equal(existsSync(join(elsewhere, '.install-check-version.json')), false)
+    assert.equal(existsSync(join(profile, '.install-check-version.json')), true)
+  } finally {
+    if (before === undefined) delete process.env.DSH_SHELL_VERSION
+    else process.env.DSH_SHELL_VERSION = before
+    if (beforeDir === undefined) delete process.env.DSH_PROFILE_DIR
+    else process.env.DSH_PROFILE_DIR = beforeDir
+    resetShellVersion()
+    await rm(root, { recursive: true, force: true })
+  }
+})
