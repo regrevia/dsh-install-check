@@ -718,3 +718,59 @@ test('the profile the host launched wins over the environment', async () => {
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('a patch that only edits an existing row does not claim it', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-row-'))
+  try {
+    const override = join(root, 'override')
+    const insert = join(root, 'insert')
+    const second = join(root, 'second')
+    const edit = join(root, 'edit')
+    for (const [dir, patch] of [
+      [override, ['- id: shared-row', '  name: alpha-memory', ''].join('\n')],
+      [insert, ['- insert:', '    - id: shared-row', '      name: alpha-memory', ''].join('\n')],
+      [edit, ['- id: shared-row', '  name: beta-memory', ''].join('\n')],
+      [second, ['- insert:', '    - id: shared-row', '      name: beta-memory', ''].join('\n')],
+    ]) {
+      await mkdir(dir, { recursive: true })
+      await writeFile(join(dir, 'package.json'), JSON.stringify({ name: dir.split('/').pop(), version: '1.0.0', dsh: { bundle: { patch: './cordis.patch.yml' } } }))
+      await writeFile(join(dir, 'cordis.patch.yml'), patch)
+    }
+    const installed = await scanPackage(insert)
+    const edited = await scanPackage(edit)
+    const added = await scanPackage(override)
+    const rival = await scanPackage(second)
+    assert.deepEqual(installed.patchInserts, ['shared-row'])
+    assert.deepEqual(edited.patchInserts, [])
+    assert.deepEqual(edited.patchOverrides, ['shared-row'])
+    // Two overrides of the same row are an edit, not a collision.
+    assert.equal(compare(added, [edited]).breaks.length, 0)
+    // An insert that overlaps another insert is.
+    assert.equal(compare(rival, [installed]).breaks.length, 1)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('an optional peer is not a missing dependency', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-opt-'))
+  try {
+    const dir = join(root, 'opt')
+    await mkdir(dir, { recursive: true })
+    await writeFile(
+      join(dir, 'package.json'),
+      JSON.stringify({
+        name: 'opt-memory',
+        version: '1.0.0',
+        peerDependencies: { '@scope/nice-to-have': '^1.0.0', '@scope/needed': '^1.0.0' },
+        peerDependenciesMeta: { '@scope/nice-to-have': { optional: true } },
+      }),
+    )
+    await writeFile(join(dir, 'index.js'), 'export function apply(ctx) {}\n')
+    const candidate = await scanPackage(dir)
+    const result = compare(candidate, [])
+    assert.deepEqual(result.missing.map((hit) => hit.key), ['@scope/needed'])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
