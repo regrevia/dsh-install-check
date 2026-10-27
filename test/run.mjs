@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, writeFile, cp } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile, readFile, cp } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { scanPackage } from '../lib/signature.js'
@@ -342,4 +342,72 @@ test('a plugin that renders into a slot stays quiet', async () => {
     '',
   ].join('\n'))
   assert.equal(scanPackageClient(dir), null)
+})
+
+test('a range that excludes this version is a mismatch, not a guess', async () => {
+  const { satisfies, versionVerdict } = await import('../lib/compat.js')
+  assert.equal(satisfies('0.2.1-rc.3', '>=0.2.0-rc.1'), true)
+  assert.equal(satisfies('0.2.1-rc.3', '^0.2.0'), true)
+  assert.equal(satisfies('0.2.1-rc.3', '>=0.2.0-rc.2 || >=0.2.1-rc.2'), true)
+  assert.equal(versionVerdict('0.2.1-rc.3', '^0.3.0'), 'below')
+  assert.equal(versionVerdict('0.9.0', '^0.2.0'), 'above')
+  assert.equal(versionVerdict('0.2.1-rc.3', 'workspace:*'), 'unknown')
+  assert.equal(versionVerdict('0.2.1-rc.3', 'nightly'), 'unknown')
+})
+
+test('a plugin that needs a newer harness is named before the install lands', async () => {
+  const { resetShellVersion } = await import('../lib/shell.js')
+  const { root, alpha } = await workspace()
+  const profile = await profileWith(alpha)
+  const needsNew = await fixture(root, {
+    manifest: { name: 'needs-new', version: '1.0.0', dsh: { engines: { dsh: '^0.3.0' }, bundle: { patch: './cordis.patch.yml' } } },
+    files: {
+      'cordis.patch.yml': ['- insert:', '    - id: needs-new', '      name: needs-new', ''].join('\n'),
+      'index.js': 'export const inject = []\nexport function apply() {}\n',
+    },
+  })
+  const before = process.env.DSH_SHELL_VERSION
+  process.env.DSH_SHELL_VERSION = '0.2.1-rc.3'
+  resetShellVersion()
+  try {
+    const checked = await checkInstall(
+      { name: 'plugin_manager', arguments: { action: 'install_bundle', target: needsNew } },
+      { profileDir: profile },
+    )
+    assert.match(checked.text.zh, /版本对不上/)
+    assert.match(checked.text.zh, /\^0\.3\.0/)
+  } finally {
+    if (before === undefined) delete process.env.DSH_SHELL_VERSION
+    else process.env.DSH_SHELL_VERSION = before
+    resetShellVersion()
+  }
+})
+
+test('after a harness update, installed plugins left behind are named once', async () => {
+  const { resetShellVersion } = await import('../lib/shell.js')
+  const { root, alpha } = await workspace()
+  const profile = await profileWith(alpha)
+  const alphaManifest = join(profile, 'node_modules', 'alpha-memory', 'package.json')
+  const manifest = JSON.parse(await readFile(alphaManifest, 'utf8'))
+  manifest.dsh = { ...manifest.dsh, engines: { dsh: '^0.3.0' } }
+  await writeFile(alphaManifest, JSON.stringify(manifest))
+  await writeFile(join(profile, '.install-check-version.json'), JSON.stringify({ version: '0.2.1-rc.3' }))
+  const before = process.env.DSH_SHELL_VERSION
+  process.env.DSH_SHELL_VERSION = '0.9.0'
+  resetShellVersion()
+  try {
+    const ctx = fakeContext()
+    apply(ctx)
+    const exec = { name: 'some_tool', arguments: {} }
+    const allow = async () => ({ kind: 'accept', content: [{ type: 'text', text: 'ok' }] })
+    const after = await withProfile(profile, () =>
+      ctx.handlers['tools/post-execute'](exec, { isError: false, content: [] }, allow),
+    )
+    const text = after.content.map((item) => item.text).join('\n')
+    assert.match(text, /0\.9\.0/)
+  } finally {
+    if (before === undefined) delete process.env.DSH_SHELL_VERSION
+    else process.env.DSH_SHELL_VERSION = before
+    resetShellVersion()
+  }
 })

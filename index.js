@@ -9,12 +9,14 @@
  * never stops an install: asking first would only cost a round trip, and
  * where approvals are unavailable an ask degrades into a refusal.
  */
-import { readFileSync, existsSync } from 'node:fs'
-import { join } from 'node:path'
+import { readFileSync, existsSync, writeFileSync } from 'node:fs'
+import { basename, join } from 'node:path'
 import { homedir } from 'node:os'
 import { scanPackage } from './lib/signature.js'
 import { compare } from './lib/check.js'
-import { render, renderSkills, renderTakeover } from './lib/report.js'
+import { render, renderSkills, renderTakeover, renderVersion, renderVersionAudit } from './lib/report.js'
+import { versionVerdict } from './lib/compat.js'
+import { declaredRange, shellVersion } from './lib/shell.js'
 import { scanPackageClient } from './lib/client.js'
 import { materialize } from './lib/materialize.js'
 import { fingerprint, findSkillConflicts, scanSkills, skillRoots } from './lib/skills.js'
@@ -78,8 +80,8 @@ function patchNames(dir) {
   }
 }
 
-/** Every package the live profile would load, including rows a bundle inserts. */
-function installedPackages(profile) {
+/** Every package directory the live profile would load, including bundle rows. */
+function installedDirs(profile) {
   let manifest = null
   try {
     manifest = JSON.parse(readFileSync(join(profile, 'package.json'), 'utf8'))
@@ -102,7 +104,47 @@ function installedPackages(profile) {
     add(bundle)
     for (const name of patchNames(dir)) add(name)
   }
-  return dirs.map(scanCached)
+  return dirs
+}
+
+function installedPackages(profile) {
+  return installedDirs(profile).map(scanCached)
+}
+
+/**
+ * A harness update can leave installed plugins behind: their declared range is
+ * read again the first time the version changes, and only the ones the new
+ * version actually leaves are named.
+ */
+function versionAudit() {
+  const version = shellVersion()
+  if (!version) return null
+  const profile = profileDir()
+  const file = join(profile, '.install-check-version.json')
+  let last = null
+  try {
+    last = JSON.parse(readFileSync(file, 'utf8'))?.version ?? null
+  } catch {
+    last = null
+  }
+  if (last === version) return null
+  try {
+    writeFileSync(file, JSON.stringify({ version }))
+  } catch {
+    return null
+  }
+  // First sighting on this machine: nothing has changed yet.
+  if (!last) return null
+
+  const names = []
+  for (const dir of installedDirs(profile)) {
+    const range = declaredRange(dir)
+    if (!range) continue
+    const verdict = versionVerdict(version, range)
+    if (verdict === 'below' || verdict === 'above') names.push(basename(dir))
+  }
+  if (!names.length) return null
+  return renderVersionAudit(names, version).zh
 }
 
 function parseArgs(exec) {
@@ -146,10 +188,18 @@ export async function checkInstall(exec, options = {}) {
     const result = compare(candidate, installedPackages(profile))
     // No shared name, no missing dependency — and still able to eat the window.
     const takeover = scanPackageClient(dir)
+    const version = shellVersion()
+    const range = version ? declaredRange(dir) : null
+    const verdict = range ? versionVerdict(version, range) : 'unknown'
     const zh = []
     const en = []
     if (!result.ok) {
       const note = render(candidate, result)
+      zh.push(note.zh)
+      en.push(note.en)
+    }
+    if (verdict === 'below' || verdict === 'above') {
+      const note = renderVersion(verdict, version, range)
       zh.push(note.zh)
       en.push(note.en)
     }
@@ -190,6 +240,12 @@ export function apply(ctx) {
     if (held && Date.now() - held.at <= TTL) texts.push(held.checked.text.zh)
     const note = skillNote()
     if (note) texts.push(note)
+    try {
+      const audit = versionAudit()
+      if (audit) texts.push(audit)
+    } catch {
+      // A version note must never take down a tool result.
+    }
     if (!texts.length) return decision
 
     return {
