@@ -6,7 +6,9 @@ import { join } from 'node:path'
 import { scanPackage } from '../lib/signature.js'
 import { compare } from '../lib/check.js'
 import { render } from '../lib/report.js'
-import { checkInstall, apply } from '../index.js'
+import { scanSkills, findSkillConflicts, skillRoots } from '../lib/skills.js'
+import { renderSkills } from '../lib/report.js'
+import { checkInstall, apply, resetSkillWatch } from '../index.js'
 
 const PATCH = ['- insert:', '    - id: alpha-memory', '      name: alpha-memory', ''].join('\n')
 
@@ -214,4 +216,95 @@ test('lets a tool-name overlap install and appends the note', async () => {
   )
   assert.equal(after.content.length, 2)
   assert.match(after.content[1].text, /memory_save/)
+})
+
+async function skillDir(root, folder, frontmatter) {
+  const dir = join(root, folder)
+  await mkdir(dir, { recursive: true })
+  await writeFile(join(dir, 'SKILL.md'), `---\n${frontmatter}\n---\n\nbody\n`)
+  return dir
+}
+
+const WORKBOOK = 'Format and validate a spreadsheet workbook, freeze header rows, add formulas, recalculate cached values'
+const WORKBOOK_PDF = 'Format and validate a spreadsheet workbook, freeze header rows, add formulas, recalculate cached values, export to PDF'
+
+test('two skills with one name: one of them never loads', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'install-check-skills-'))
+  await skillDir(join(home, '.dsh', 'skills'), 'weekly-report', 'name: weekly-report\ndescription: Build the weekly revenue report.')
+  await skillDir(join(home, '.agents', 'skills'), 'weekly-report', 'name: weekly-report\ndescription: Build the weekly revenue report with charts.')
+
+  const conflicts = findSkillConflicts(scanSkills(skillRoots(home)))
+  assert.equal(conflicts.names.length, 1)
+  assert.equal(conflicts.names[0].name, 'weekly-report')
+  assert.equal(conflicts.names[0].paths.length, 2)
+  const zh = renderSkills(conflicts).zh.split('\n')
+  assert.equal(zh.length, 1)
+  assert.match(zh[0], /^冲突：两个 skill 都叫 weekly-report，只会生效一个。留一个，或给其中一个改名。$/)
+  assert.match(renderSkills(conflicts).en, /^Conflict: two skills are both named weekly-report/)
+})
+
+test('two skills that answer the same requests: the model picks wrong', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'install-check-skills-'))
+  const root = join(home, '.agents', 'skills')
+  await skillDir(root, 'sheet-edit', `name: sheet-edit\ndescription: ${WORKBOOK}.`)
+  await skillDir(root, 'print-sheet', `name: print-sheet\ndescription: ${WORKBOOK_PDF}.`)
+  await skillDir(root, 'salsa', 'name: salsa\ndescription: Write dance choreography notes for a salsa rehearsal.')
+
+  const conflicts = findSkillConflicts(scanSkills(skillRoots(home)))
+  assert.equal(conflicts.names.length, 0)
+  assert.equal(conflicts.overlaps.length, 1)
+  assert.deepEqual([conflicts.overlaps[0].a, conflicts.overlaps[0].b].sort(), ['print-sheet', 'sheet-edit'])
+  const zh = renderSkills(conflicts).zh.split('\n')
+  assert.equal(zh.length, 1)
+  assert.match(zh[0], /^撞车：(sheet-edit|print-sheet) 和 (sheet-edit|print-sheet) 的触发描述几乎一样，模型会挑错。改其中一个的描述，或只留一个。$/)
+})
+
+test('two versions of one skill are not a conflict', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'install-check-skills-'))
+  const root = join(home, '.agents', 'skills')
+  await skillDir(root, 'tool-stable', `name: tool-stable\ndescription: ${WORKBOOK}.`)
+  await skillDir(root, 'tool-next', `name: tool-next\ndescription: ${WORKBOOK_PDF}.`)
+  const conflicts = findSkillConflicts(scanSkills(skillRoots(home)))
+  assert.equal(conflicts.overlaps.length, 0)
+})
+
+test('distinct skills stay quiet', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'install-check-skills-'))
+  const root = join(home, '.dsh', 'skills')
+  await skillDir(root, 'deploy', 'name: deploy\ndescription: Ship the current branch to the staging cluster.')
+  await skillDir(root, 'invoice', 'name: invoice\ndescription: Reconcile supplier invoices against the ledger.')
+  const conflicts = findSkillConflicts(scanSkills(skillRoots(home)))
+  assert.equal(conflicts.names.length, 0)
+  assert.equal(conflicts.overlaps.length, 0)
+  assert.equal(renderSkills(conflicts).zh, '')
+})
+
+test('a dropped skill folder gets one note on the next tool result', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'install-check-home-'))
+  await skillDir(join(home, '.dsh', 'skills'), 'weekly-report', 'name: weekly-report\ndescription: Build the weekly revenue report.')
+  await skillDir(home, '.agents-placeholder', 'name: x\ndescription: x')
+
+  const before = process.env.INSTALL_CHECK_HOME
+  process.env.INSTALL_CHECK_HOME = home
+  resetSkillWatch()
+  try {
+    const ctx = fakeContext()
+    apply(ctx)
+    const accept = async () => ({ kind: 'accept', content: [{ type: 'text', text: 'copied' }] })
+    const quiet = await ctx.handlers['tools/post-execute']({ name: 'bash', arguments: {} }, { isError: false }, accept)
+    assert.equal(quiet.content.length, 1)
+
+    await skillDir(join(home, '.agents', 'skills'), 'weekly-report', 'name: weekly-report\ndescription: Build the weekly revenue report with charts.')
+    resetSkillWatch()
+    const after = await ctx.handlers['tools/post-execute']({ name: 'bash', arguments: {} }, { isError: false }, accept)
+    assert.equal(after.content.length, 2)
+    assert.match(after.content[1].text, /两个 skill 都叫 weekly-report/)
+
+    const again = await ctx.handlers['tools/post-execute']({ name: 'bash', arguments: {} }, { isError: false }, accept)
+    assert.equal(again.content.length, 1)
+  } finally {
+    if (before === undefined) delete process.env.INSTALL_CHECK_HOME
+    else process.env.INSTALL_CHECK_HOME = before
+    resetSkillWatch()
+  }
 })

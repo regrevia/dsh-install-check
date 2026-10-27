@@ -14,15 +14,40 @@ import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { scanPackage } from './lib/signature.js'
 import { compare } from './lib/check.js'
-import { render } from './lib/report.js'
+import { render, renderSkills } from './lib/report.js'
 import { materialize } from './lib/materialize.js'
+import { fingerprint, findSkillConflicts, scanSkills, skillRoots } from './lib/skills.js'
 
 export const name = 'install-check'
 export const inject = ['tools']
 
 const TTL = 60_000
+const SKILL_TTL = 3_000
 const scanCache = new Map()
 const pending = new Map()
+
+/** Skills arrive as files, so they are noticed on the first tool call after the change. */
+const skillState = { checkedAt: 0, seen: null, told: new Set() }
+
+function skillNote() {
+  const now = Date.now()
+  if (now - skillState.checkedAt < SKILL_TTL) return null
+  skillState.checkedAt = now
+
+  const roots = skillRoots()
+  const print = fingerprint(roots)
+  if (print === skillState.seen) return null
+  skillState.seen = print
+
+  const conflicts = findSkillConflicts(scanSkills(roots))
+  const names = conflicts.names.filter((hit) => !skillState.told.has(`name:${hit.name}`))
+  const overlaps = conflicts.overlaps.filter((hit) => !skillState.told.has(`overlap:${hit.a}|${hit.b}`))
+  if (!names.length && !overlaps.length) return null
+
+  for (const hit of names) skillState.told.add(`name:${hit.name}`)
+  for (const hit of overlaps) skillState.told.add(`overlap:${hit.a}|${hit.b}`)
+  return renderSkills({ names, overlaps }).zh
+}
 
 function profileDir() {
   const explicit = process.env.DSH_PROFILE_DIR
@@ -94,6 +119,13 @@ function key(exec) {
   return typeof target === 'string' ? target.trim() : ''
 }
 
+/** Test seam: forget what has been reported so a fixture home can be checked. */
+export function resetSkillWatch() {
+  skillState.checkedAt = 0
+  skillState.seen = null
+  skillState.told.clear()
+}
+
 export async function checkInstall(exec, options = {}) {
   if (exec?.name !== 'plugin_manager') return null
   const call = parseArgs(exec)
@@ -134,16 +166,20 @@ export function apply(ctx) {
 
   ctx.on('tools/post-execute', async (exec, result, next) => {
     const held = pending.get(key(exec))
-    if (!held) return next()
-    pending.delete(key(exec))
+    if (held) pending.delete(key(exec))
 
     const decision = await next()
     if (result?.isError || decision?.kind !== 'accept' || !decision.content) return decision
-    if (Date.now() - held.at > TTL) return decision
+
+    const texts = []
+    if (held && Date.now() - held.at <= TTL) texts.push(held.checked.text.zh)
+    const note = skillNote()
+    if (note) texts.push(note)
+    if (!texts.length) return decision
 
     return {
       ...decision,
-      content: [...decision.content, { type: 'text', text: held.checked.text.zh }],
+      content: [...decision.content, ...texts.map((text) => ({ type: 'text', text }))],
     }
   })
 }
