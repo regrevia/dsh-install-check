@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, writeFile, readFile, cp, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile, readFile, cp, rm, symlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { scanPackage } from '../lib/signature.js'
@@ -9,7 +9,7 @@ import { render } from '../lib/report.js'
 import { scanSkills, findSkillConflicts, skillRoots } from '../lib/skills.js'
 import { renderSkills } from '../lib/report.js'
 import { scanPackageClient } from '../lib/client.js'
-import { renderTakeover } from '../lib/report.js'
+import { renderTakeover, renderIncomplete } from '../lib/report.js'
 import { checkInstall, apply, resetSkillWatch } from '../index.js'
 
 const PATCH = ['- insert:', '    - id: alpha-memory', '      name: alpha-memory', ''].join('\n')
@@ -259,7 +259,7 @@ test('two skills that answer the same requests: the model picks wrong', async ()
   assert.deepEqual([conflicts.overlaps[0].a, conflicts.overlaps[0].b].sort(), ['print-sheet', 'sheet-edit'])
   const zh = renderSkills(conflicts).zh.split('\n')
   assert.equal(zh.length, 1)
-  assert.match(zh[0], /^撞车：(sheet-edit|print-sheet) 和 (sheet-edit|print-sheet) 的触发描述几乎一样，模型会挑错。改其中一个的描述，或只留一个。$/)
+  assert.match(zh[0], /^两个 skill 的描述相似：(sheet-edit|print-sheet) 和 (sheet-edit|print-sheet)，建议检查触发边界。$/)
 })
 
 test('two versions of one skill are not a conflict', async () => {
@@ -361,7 +361,7 @@ test('a plugin that needs a newer harness is named before the install lands', as
   const { root, alpha } = await workspace()
   const profile = await profileWith(alpha)
   const needsNew = await fixture(root, {
-    manifest: { name: 'needs-new', version: '1.0.0', dsh: { engines: { dsh: '^0.3.0' }, bundle: { patch: './cordis.patch.yml' } } },
+    manifest: { name: 'needs-new', version: '1.0.0', engines: { dsh: '^0.3.0' }, dsh: { bundle: { patch: './cordis.patch.yml' } } },
     files: {
       'cordis.patch.yml': ['- insert:', '    - id: needs-new', '      name: needs-new', ''].join('\n'),
       'index.js': 'export const inject = []\nexport function apply() {}\n',
@@ -390,7 +390,7 @@ test('after a harness update, installed plugins left behind are named once', asy
   const profile = await profileWith(alpha)
   const alphaManifest = join(profile, 'node_modules', 'alpha-memory', 'package.json')
   const manifest = JSON.parse(await readFile(alphaManifest, 'utf8'))
-  manifest.dsh = { ...manifest.dsh, engines: { dsh: '^0.3.0' } }
+  manifest.engines = { dsh: '^0.3.0' }
   await writeFile(alphaManifest, JSON.stringify(manifest))
   await writeFile(join(profile, '.install-check-version.json'), JSON.stringify({ version: '0.2.1-rc.3' }))
   const before = process.env.DSH_SHELL_VERSION
@@ -438,6 +438,7 @@ test('the loader answer splits what broke from what is only waiting', async () =
   assert.deepEqual(inactive({ loader: { entries: () => entries } }), {
     broken: ['alpha-memory'],
     waiting: ['waiting'],
+    settling: true,
   })
   assert.equal(inactive({}), null)
 })
@@ -614,7 +615,11 @@ test('a loader that is still moving is not called broken', async () => {
     { options: { name: 'no-fiber-row' } },
     { options: { name: 'healthy' }, fiber: { state: 2 } },
   ]
-  assert.deepEqual(inactive({ loader: { entries: () => entries } }), { broken: [], waiting: [] })
+  assert.deepEqual(inactive({ loader: { entries: () => entries } }), {
+    broken: [],
+    waiting: [],
+    settling: true,
+  })
 })
 
 test('a build without a loader does not consume the first sighting', async () => {
@@ -843,4 +848,326 @@ test('two Chinese descriptions that answer the same requests overlap', async () 
   const conflicts = findSkillConflicts(scanSkills(skillRoots(home)))
   assert.equal(conflicts.overlaps.length, 1)
   assert.deepEqual([conflicts.overlaps[0].a, conflicts.overlaps[0].b].sort(), ['sales-chart', 'zhoubao'])
+})
+
+test('a route is read only from the call that registers it', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'install-check-route-'))
+  const dir = join(root, 'route-plugin')
+  await mkdir(dir, { recursive: true })
+  await writeFile(join(dir, 'package.json'), JSON.stringify({ name: 'route-plugin', version: '1.0.0' }))
+  await writeFile(join(dir, 'index.js'), [
+    "const KIND = { kind: 'prefix' }",
+    "const WHERE = { path: '/one' }",
+    "const TABLE = { kind: 'prefix', path: '/data' }",
+    "// ctx.webServer.register({ kind: 'prefix', path: '/commented' })",
+    'export function apply(ctx) {',
+    '  ctx.webServer.register(KIND, WHERE)',
+    '  ctx.webServer.register({ kind: RELATIVE_KIND })',
+    "  ctx.webServer.register({ kind: 'exact', path: '/real' })",
+    '}',
+    '',
+  ].join('\n'))
+  assert.deepEqual(scanPackage(dir).routes, ['exact:/real'])
+})
+
+test('a name on some other object is not a tool', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'install-check-tool-'))
+  const dir = join(root, 'tool-plugin')
+  await mkdir(dir, { recursive: true })
+  await writeFile(join(dir, 'package.json'), JSON.stringify({ name: 'tool-plugin', version: '1.0.0' }))
+  await writeFile(join(dir, 'index.js'), [
+    'export function apply(ctx) {',
+    "  const labels = { name: 'not_a_tool' }",
+    "  // ctx.tools.register(defineTool({ name: 'commented_out' }))",
+    "  ctx.tools.register(defineTool({ name: 'memory_search', description: 'real' }))",
+    "  ctx.webServer.register({ kind: 'exact', path: '/x', name: '/not-a-tool' })",
+    '}',
+    '',
+  ].join('\n'))
+  assert.deepEqual(scanPackage(dir).tools, ['memory_search'])
+})
+
+test('a per-agent tool reads as a possible override, not a broken install', async () => {
+  const { root, alpha } = await workspace()
+  const scoped = await fixture(root, {
+    manifest: { name: 'scoped-memory', version: '1.0.0' },
+    files: {
+      'index.js': [
+        'export function apply(ctx) {',
+        "  ctx.agent.ctx.tools.register(defineTool({ name: 'memory_save', description: 'only for one agent' }))",
+        '}',
+        '',
+      ].join('\n'),
+    },
+  })
+  const candidate = scanPackage(scoped)
+  assert.deepEqual(candidate.scopedTools, ['memory_save'])
+  const result = compare(candidate, [scanPackage(alpha)])
+  assert.equal(result.breaks[0].certain, false)
+  const text = render(candidate, result)
+  assert.match(text.zh, /可能有一个起不来/)
+  assert.doesNotMatch(text.zh, /后装的那个起不来/)
+})
+
+test('an install run from a program still gets its note', async () => {
+  const { root, alpha } = await workspace()
+  const profile = await profileWith(alpha)
+  const gamma = await fixture(root, GAMMA)
+  const ctx = fakeContext()
+  apply(ctx)
+  const accept = async () => ({ kind: 'accept', content: [{ type: 'text', text: 'ran' }] })
+  const outer = { name: 'run_code', token: 'root-1', arguments: { code: 'await tools.plugin_manager()' } }
+  const sub = {
+    name: 'plugin_manager',
+    token: 'root-1:ptc:1',
+    rootCallId: 'root-1',
+    parent: 'root-1',
+    arguments: { action: 'install_bundle', target: gamma },
+  }
+
+  await withProfile(profile, () => ctx.handlers['tools/pre-execute'](sub, accept))
+  const decision = await withProfile(profile, () =>
+    ctx.handlers['tools/post-execute'](sub, { isError: false, value: 'installed' }, accept),
+  )
+  assert.equal(decision.content.length, 1)
+  assert.equal(decision.additionalContexts.length, 1)
+  assert.equal(decision.additionalContexts[0].role, 'user')
+  assert.match(decision.additionalContexts[0].content[0].text, /memory_save/)
+  assert.ok(outer.token)
+})
+
+test('a row whose import failed is named, a composition row is not', async () => {
+  const { inactive } = await import('../lib/loader.js')
+  const running = { ctx: { fiber: { uid: 7 } } }
+  const entries = [
+    { options: { name: 'failed-import' }, parent: running },
+    { options: { name: 'group-row' }, parent: { ctx: {} } },
+    { options: { name: 'disposed' }, parent: running, fiber: { state: 4 } },
+    { options: { name: 'healthy' }, parent: running, fiber: { state: 2 } },
+  ]
+  assert.deepEqual(inactive({ loader: { entries: () => entries } }), {
+    broken: ['failed-import', 'disposed'],
+    waiting: [],
+    settling: false,
+  })
+})
+
+test('enabling a package that collides is flagged before it turns on', async () => {
+  const { root, alpha } = await workspace()
+  const profile = await profileWith(alpha)
+  const beta = await fixture(root, {
+    manifest: { name: 'beta-memory', version: '1.0.0', dsh: { bundle: { patch: './cordis.patch.yml' } } },
+    files: {
+      'cordis.patch.yml': ['- insert:', '    - id: beta-memory', '      name: beta-memory', ''].join('\n'),
+      'index.js': [
+        'export function apply(ctx) {',
+        "  ctx.tools.register(defineTool({ name: 'memory_save', description: 'same name' }))",
+        '}',
+        '',
+      ].join('\n'),
+    },
+  })
+  await cp(beta, join(profile, 'node_modules', 'beta-memory'), { recursive: true })
+  const ctx = fakeContext()
+  apply(ctx)
+  const exec = { name: 'plugin_manager', token: 'enable-1', arguments: { action: 'set_bundle', enabled: true, target: 'beta-memory' } }
+  const accept = async () => ({ kind: 'accept', content: [{ type: 'text', text: 'enabled' }] })
+
+  await withProfile(profile, () => ctx.handlers['tools/pre-execute'](exec, accept))
+  const after = await withProfile(profile, () =>
+    ctx.handlers['tools/post-execute'](exec, { isError: false, content: [] }, accept),
+  )
+  const text = after.content.map((item) => item.text).join('\n')
+  assert.match(text, /memory_save/)
+})
+
+test('a loader still moving keeps its answer open for the next look', async () => {
+  const { resetShellVersion } = await import('../lib/shell.js')
+  const { root, alpha } = await workspace()
+  const profile = await profileWith(alpha)
+  await writeFile(join(profile, '.install-check-version.json'), JSON.stringify({ version: '0.2.1-rc.3' }))
+  const before = process.env.DSH_SHELL_VERSION
+  process.env.DSH_SHELL_VERSION = '0.2.2'
+  resetShellVersion()
+  try {
+    const moving = fakeContext({
+      loader: { entries: () => [{ options: { name: 'alpha-memory' }, fiber: { state: 1 } }] },
+    })
+    apply(moving)
+    assert.equal(await postNote(profile, moving), 'ok')
+
+    const settled = fakeContext({
+      loader: { entries: () => [{ options: { name: 'alpha-memory' }, fiber: { state: 3 } }] },
+    })
+    apply(settled)
+    assert.match(await postNote(profile, settled), /升级后起不来：alpha-memory/)
+  } finally {
+    if (before === undefined) delete process.env.DSH_SHELL_VERSION
+    else process.env.DSH_SHELL_VERSION = before
+    resetShellVersion()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('an install clears what the old file said about the packages', async () => {
+  const { checkInstall } = await import('../index.js')
+  const { root, alpha } = await workspace()
+  const profile = await profileWith(alpha)
+  const gamma = await fixture(root, GAMMA)
+  const exec = { name: 'plugin_manager', arguments: { action: 'install_bundle', target: gamma } }
+
+  const first = await checkInstall(exec, { profileDir: profile })
+  assert.match(first.text.zh, /memory_save/)
+
+  await writeFile(
+    join(profile, 'node_modules', 'alpha-memory', 'index.js'),
+    'export function apply() {}\n',
+  )
+
+  const ctx = fakeContext()
+  apply(ctx)
+  await ctx.handlers['tools/post-execute'](
+    { name: 'plugin_manager', token: 'install-2', arguments: { action: 'install_bundle', target: gamma } },
+    { isError: false, content: [] },
+    async () => ({ kind: 'accept', content: [{ type: 'text', text: 'installed' }] }),
+  )
+
+  assert.equal(await checkInstall(exec, { profileDir: profile }), null)
+})
+
+test('a partial ceiling covers the whole range it names', async () => {
+  const { satisfies } = await import('../lib/compat.js')
+  assert.equal(satisfies('1.5.0', '<=1'), true)
+  assert.equal(satisfies('2.0.0', '<=1'), false)
+  assert.equal(satisfies('1.2.9', '<=1.2'), true)
+  assert.equal(satisfies('1.3.0', '<=1.2'), false)
+  assert.equal(satisfies('1.2.3', '<=1.2.3'), true)
+  assert.equal(satisfies('1.2.4', '<=1.2.3'), false)
+  assert.equal(satisfies('0.2.1-rc.3', '>=0.2.0-rc.1'), true)
+  assert.equal(satisfies('1.0.0', '>=0.2.0-rc.1'), true)
+})
+
+test('a skill folder reached through a link is still a skill', async () => {
+  const { root } = await workspace()
+  const home = join(root, 'home')
+  const real = join(root, 'real-skill')
+  await mkdir(real, { recursive: true })
+  await writeFile(join(real, 'SKILL.md'), '---\nname: linked-skill\ndescription: does one thing\n---\n')
+  const linked = join(home, '.dsh', 'skills')
+  await mkdir(linked, { recursive: true })
+  await symlink(real, join(linked, 'linked-skill'))
+  const { scanSkills } = await import('../lib/skills.js')
+  const skills = scanSkills([linked])
+  assert.deepEqual(skills.map((skill) => skill.name), ['linked-skill'])
+})
+
+test('two skills that differ by more than a version marker are compared', async () => {
+  const { findSkillConflicts } = await import('../lib/skills.js')
+  const words = new Set(['build', 'page', 'layout', 'preview', 'render', 'export', 'screenshot', 'device'])
+  const conflicts = findSkillConflicts([
+    { name: 'ui-review', file: 'a', words },
+    { name: 'ui-preview', file: 'b', words },
+    { name: 'sandbox-next', file: 'c', words: new Set(['sandbox', 'preview', 'edge', 'runtime', 'deploy', 'isolate', 'container', 'worker']) },
+    { name: 'sandbox-stable', file: 'd', words: new Set(['sandbox', 'preview', 'edge', 'runtime', 'deploy', 'isolate', 'container', 'worker']) },
+  ])
+  assert.deepEqual(conflicts.overlaps.map((hit) => [hit.a, hit.b].sort()), [['ui-preview', 'ui-review']])
+})
+
+test('a check that could not finish says so instead of staying quiet', async () => {
+  assert.match(renderIncomplete('not-found').zh, /^没检查完：.*看一眼有没有报错。$/)
+  assert.match(renderIncomplete('network').en, /^Check unfinished: /)
+  assert.match(renderIncomplete('slow').zh, /没检查完/)
+  assert.match(renderIncomplete('unknown').zh, /^没检查完，装完看一眼有没有报错。$/)
+})
+
+test('an edited package is read again, not remembered', async () => {
+  const { root, alpha } = await workspace()
+  const profile = await profileWith(alpha)
+  const gamma = await fixture(root, GAMMA)
+  const exec = { name: 'plugin_manager', arguments: { action: 'install_bundle', target: gamma } }
+  const first = await checkInstall(exec, { profileDir: profile })
+  assert.match(first.text.zh, /memory_save/)
+
+  await writeFile(
+    join(profile, 'node_modules', 'alpha-memory', 'index.js'),
+    "export function apply(ctx) {\n  ctx.tools.register(defineTool({ name: 'memory_recall', description: 'save' }))\n}\n",
+  )
+  const second = await checkInstall(exec, { profileDir: profile })
+  assert.equal(second, null)
+})
+
+test('a package already in the profile is read in place', async () => {
+  const { alpha } = await workspace()
+  const profile = await profileWith(alpha)
+  const started = Date.now()
+  const checked = await checkInstall(
+    { name: 'plugin_manager', arguments: { action: 'install_bundle', target: 'alpha-memory@1.0.0' } },
+    { profileDir: profile },
+  )
+  assert.equal(checked, null)
+  assert.ok(Date.now() - started < 5000)
+})
+
+test('a version rule the harness never reads stays quiet', async () => {
+  const { resetShellVersion } = await import('../lib/shell.js')
+  const { root, alpha } = await workspace()
+  const profile = await profileWith(alpha)
+  const quiet = await fixture(root, {
+    manifest: {
+      name: 'quiet-requirement',
+      version: '1.0.0',
+      dsh: { engines: { dsh: '^9.0.0' }, bundle: { patch: './cordis.patch.yml' } },
+    },
+    files: {
+      'cordis.patch.yml': ['- insert:', '    - id: quiet-requirement', '      name: quiet-requirement', ''].join('\n'),
+      'index.js': 'export const inject = []\nexport function apply() {}\n',
+    },
+  })
+  const before = process.env.DSH_SHELL_VERSION
+  process.env.DSH_SHELL_VERSION = '0.2.1-rc.3'
+  resetShellVersion()
+  try {
+    const checked = await checkInstall(
+      { name: 'plugin_manager', arguments: { action: 'install_bundle', target: quiet } },
+      { profileDir: profile },
+    )
+    assert.equal(checked, null)
+  } finally {
+    if (before === undefined) delete process.env.DSH_SHELL_VERSION
+    else process.env.DSH_SHELL_VERSION = before
+    resetShellVersion()
+  }
+})
+
+test('a harness peer range is read the way the harness reads it', async () => {
+  const { resetShellVersion } = await import('../lib/shell.js')
+  const { root, alpha } = await workspace()
+  const profile = await profileWith(alpha)
+  const peer = await fixture(root, {
+    manifest: {
+      name: 'peer-requirement',
+      version: '1.0.0',
+      peerDependencies: { '@deepseek-ai/dsh': '^0.3.0' },
+      dsh: { bundle: { patch: './cordis.patch.yml' } },
+    },
+    files: {
+      'cordis.patch.yml': ['- insert:', '    - id: peer-requirement', '      name: peer-requirement', ''].join('\n'),
+      'index.js': 'export const inject = []\nexport function apply() {}\n',
+    },
+  })
+  const before = process.env.DSH_SHELL_VERSION
+  process.env.DSH_SHELL_VERSION = '0.2.1-rc.3'
+  resetShellVersion()
+  try {
+    const checked = await checkInstall(
+      { name: 'plugin_manager', arguments: { action: 'install_bundle', target: peer } },
+      { profileDir: profile },
+    )
+    assert.ok(checked)
+    assert.match(checked.text.zh, /版本对不上/)
+  } finally {
+    if (before === undefined) delete process.env.DSH_SHELL_VERSION
+    else process.env.DSH_SHELL_VERSION = before
+    resetShellVersion()
+  }
 })

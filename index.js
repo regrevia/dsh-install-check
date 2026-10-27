@@ -9,8 +9,9 @@
  * cost a round trip, and where approvals are unavailable an ask degrades into
  * a refusal.
  */
-import { readFileSync, existsSync, writeFileSync } from 'node:fs'
-import { basename, join } from 'node:path'
+import { readdirSync, readFileSync, existsSync, statSync, writeFileSync } from 'node:fs'
+import { basename, join, isAbsolute } from 'node:path'
+import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { scanPackage } from './lib/signature.js'
 import { compare } from './lib/check.js'
@@ -20,19 +21,21 @@ import {
   renderSkills,
   renderTakeover,
   renderUnconnected,
+  renderIncomplete,
   renderVersion,
   renderVersionAudit,
 } from './lib/report.js'
-import { versionVerdict } from './lib/compat.js'
-import { declaredRange, shellVersion } from './lib/shell.js'
+import { satisfies, versionVerdict } from './lib/compat.js'
+import { declaredRanges, shellVersion } from './lib/shell.js'
 import { inactive } from './lib/loader.js'
 import { scanPackageClient } from './lib/client.js'
-import { materialize } from './lib/materialize.js'
+import { Incomplete, materialize } from './lib/materialize.js'
 import { fingerprint, findSkillConflicts, scanSkills, skillRoots } from './lib/skills.js'
 
 export const name = 'install-check'
 export const inject = ['tools']
 
+const ALTERNATE = new Set(['workspace:^', 'workspace:~', 'workspace:*'])
 const TTL = 30 * 60_000
 const SKILL_TTL = 3_000
 const scanCache = new Map()
@@ -77,11 +80,34 @@ function profileDir(ctx) {
   return join(homedir(), '.dsh', 'profiles', 'desktop')
 }
 
+/** Files edited in place keep their path, so the fingerprint is what can change. */
+function stamp(dir) {
+  const parts = []
+  try {
+    for (const entry of readdirSync(dir, { withFileTypes: true }).slice(0, 64)) {
+      if (!entry.isFile()) continue
+      try {
+        parts.push(`${entry.name}:${statSync(join(dir, entry.name)).mtimeMs}`)
+      } catch {
+        // a file that vanished mid-read is not worth a retry
+      }
+    }
+  } catch {
+    return null
+  }
+  return parts.join('|')
+}
+
 function scanCached(dir) {
-  const hit = scanCache.get(dir)
-  if (hit && Date.now() - hit.at < TTL) return hit.signature
+  const held = scanCache.get(dir)
+  const now = Date.now()
+  if (held && now - held.at < TTL) {
+    const current = stamp(dir)
+    // The same path with different bytes is a different package.
+    if (current !== null && current === held.stamp) return held.signature
+  }
   const signature = scanPackage(dir)
-  scanCache.set(dir, { at: Date.now(), signature })
+  scanCache.set(dir, { at: Date.now(), signature, stamp: stamp(dir) })
   return signature
 }
 
@@ -163,25 +189,53 @@ async function versionAudit(ctx) {
   // what is not running right now.
   if (needRange && previous) {
     for (const dir of dirs) {
-      const range = declaredRange(dir)
-      if (!range) continue
-      const verdict = versionVerdict(version, range)
-      if (verdict === 'below' || verdict === 'above') stale.push(basename(dir))
+      // The harness reads `workspace:` shorthands as "this build", so they can
+      // never be out of range.
+      const unmet = (declaredRanges(dir) ?? []).filter(({ range }) => !ALTERNATE.has(range))
+      if (unmet.some(({ range }) => ['below', 'above'].includes(versionVerdict(version, range)))) {
+        stale.push(basename(dir))
+      }
     }
   }
   const mine = (name) => installed.has(name) && !stale.includes(name)
   const broken = live ? live.broken.filter(mine) : []
   const waiting = live ? live.waiting.filter((name) => mine(name) && !broken.includes(name)) : []
 
+  // Same plugin, same version, same complaint: say it once. A loader that is
+  // still moving is asked again next time instead of being written down as done.
+  const told = seen?.told && typeof seen.told === 'object' ? seen.told : {}
+  const fresh = (names, issue) => names.filter((name) => !String(told[name] ?? '').split(',').includes(issue))
+  const staleFresh = fresh(stale, 'stale')
+  const brokenFresh = fresh(broken, 'broken')
+  const waitingFresh = fresh(waiting, 'waiting')
+
   const lines = []
-  if (stale.length) lines.push(renderVersionAudit(stale, version).zh)
-  if (broken.length) lines.push(renderBroken(broken).zh)
-  if (waiting.length) lines.push(renderUnconnected(waiting).zh)
+  if (staleFresh.length) lines.push(renderVersionAudit(staleFresh, version).zh)
+  if (brokenFresh.length) lines.push(renderBroken(brokenFresh).zh)
+  if (waitingFresh.length) lines.push(renderUnconnected(waitingFresh).zh)
+
+  const nextTold = { ...told }
+  const remember = (names, issue) => {
+    for (const name of names) {
+      const issues = new Set(String(nextTold[name] ?? '').split(',').filter(Boolean))
+      issues.add(issue)
+      nextTold[name] = [...issues].join(',')
+    }
+  }
+  remember(staleFresh, 'stale')
+  remember(brokenFresh, 'broken')
+  remember(waitingFresh, 'waiting')
 
   try {
     writeFileSync(
       file,
-      JSON.stringify({ version, range: true, loader: live !== null, at: new Date().toISOString() }),
+      JSON.stringify({
+        version,
+        range: true,
+        loader: live !== null && !live.settling,
+        at: new Date().toISOString(),
+        told: nextTold,
+      }),
     )
   } catch {
     return null
@@ -211,16 +265,27 @@ function parseArgs(exec) {
 }
 
 /**
- * One call, one reminder. Each dispatch carries its own id and call id; the
- * target is only a fallback for callers that pass neither, since two sessions
- * installing the same spec would otherwise share one entry.
+ * One call, one reminder, even when the call is a step inside a program: a
+ * sub-call reports the program's root id, and that is the identity the check
+ * was filed under. The target is only a fallback for callers that pass neither,
+ * since two sessions installing the same spec would otherwise share one entry.
  */
 function key(exec) {
+  const root = exec?.rootCallId
+  if (typeof root === 'string' && root) return root
   const dispatchId = exec?.['token'] ?? exec?.callId // ui-copy-ignore
   if (typeof dispatchId === 'string' && dispatchId) return dispatchId
   if (typeof dispatchId === 'symbol') return dispatchId
   const target = exec?.arguments?.target
   return typeof target === 'string' && target.trim() ? `target:${target.trim()}` : null
+}
+
+/** A reminder about a sub-call has to travel as context; content never reaches it. */
+function asContext(texts) {
+  // Shape the harness expects for a carried reminder: a plain user message.
+  return texts.map((text) => ({
+    id: randomUUID(), role: 'user', content: [{ type: 'text', text }], source: { kind: 'ptc-mode' },
+  }))
 }
 
 /** Entries whose call never came back must not pile up. */
@@ -237,18 +302,72 @@ export function resetSkillWatch() {
   skillState.told.clear()
 }
 
+/** Enabling moves a package already in the profile; the copy there is the candidate. */
+function enabledCheck(call, profile) {
+  const dir = join(profile, 'node_modules', call.target)
+  if (!existsSync(join(dir, 'package.json'))) return null
+  const candidate = scanPackage(dir)
+  if (!candidate.isPlugin) return null
+  const result = compare(candidate, installedPackages(profile))
+  if (result.ok) return null
+  return { candidate, result, text: render(candidate, result) }
+}
+
+/** A registry target whose exact copy is already in the profile is read in place. */
+function installedCopy(target, profile) {
+  if (/^(link|file):/.test(target) || target.startsWith('.') || isAbsolute(target) || /^[a-zA-Z]:[\\/]/.test(target)) return null
+  const spec = /^((?:@[^/]+\/)?[^@]+)(?:@(.+))?$/.exec(target)
+  if (!spec) return null
+  const dir = join(profile, 'node_modules', spec[1])
+  let manifest = null
+  try {
+    manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'))
+  } catch {
+    return null
+  }
+  if (!manifest?.version) return null
+  const wanted = spec[2]
+  if (!wanted || wanted === 'latest' || wanted === manifest.version) return dir
+  return satisfies(manifest.version, wanted) === true ? dir : null
+}
+
 export async function checkInstall(exec, options = {}) {
   if (exec?.name !== 'plugin_manager') return null
   const call = parseArgs(exec)
-  if (!call || call.enable) return null
+  if (!call) return null
+  const started = Date.now()
+  const budget = options.budgetMs ?? 25_000
 
   const profile = options.profileDir ?? profileDir()
-  const { dir, cleanup } = await materialize(call.target, {
-    timeoutMs: options.timeoutMs ?? 20000,
-    signal: exec?.signal,
-  })
+  if (call.enable) {
+    try {
+      return enabledCheck(call, profile)
+    } catch {
+      return null
+    }
+  }
+
+  let dir = installedCopy(call.target, profile)
+  let cleanup = async () => {}
+  if (!dir) {
+    try {
+      const packed = await materialize(call.target, {
+        timeoutMs: Math.min(options.timeoutMs ?? 20_000, Math.max(1_000, budget - (Date.now() - started))),
+        signal: exec?.signal,
+      })
+      dir = packed.dir
+      cleanup = packed.cleanup
+    } catch (error) {
+      // Running out of room is not a verdict: say the check did not finish.
+      if (error instanceof Incomplete && error.reason !== 'missing-manifest') {
+        return { incomplete: error.reason, text: renderIncomplete(error.reason) }
+      }
+      throw error
+    }
+  }
 
   try {
+    if (Date.now() - started > budget) return { incomplete: 'slow', text: renderIncomplete('slow') }
     const candidate = scanPackage(dir)
     // plugin_manager rejects non-plugin specs on its own; don't add noise.
     if (!candidate.isPlugin) return null
@@ -257,7 +376,9 @@ export async function checkInstall(exec, options = {}) {
     // No shared name, no missing dependency — and still able to eat the window.
     const takeover = scanPackageClient(dir)
     const version = shellVersion()
-    const range = version ? declaredRange(dir) : null
+    const unmet = (version ? declaredRanges(dir) ?? [] : []).filter(({ range }) => !ALTERNATE.has(range))
+    const miss = unmet.find(({ range }) => ['below', 'above'].includes(versionVerdict(version, range)))
+    const range = miss?.range ?? null
     const verdict = range ? versionVerdict(version, range) : 'unknown'
     const zh = []
     const en = []
@@ -308,15 +429,14 @@ export function apply(ctx) {
 
     const decision = await next()
     if (result?.isError || decision?.kind !== 'accept') return decision
-    // Replacing the value rebuilds the content, so text cannot ride along.
-    if (Object.hasOwn(decision, 'value')) return decision
-    const base = Array.isArray(decision.content) ? decision.content : result?.content
-    if (!Array.isArray(base)) return decision
 
     // `failed` and `cancelled` changes already say what happened; adding our
     // notes would describe an install that did not take place.
     const application = applicationOf(result)
     if (application === 'failed' || application === 'cancelled') return decision
+    // The profile changed under us; signatures read before the install described
+    // the old files and must not be reused for the next check.
+    scanCache.clear()
 
     const texts = []
     if (held) texts.push(held.checked.text.zh)
@@ -329,6 +449,19 @@ export function apply(ctx) {
       // A version note must never take down a tool result.
     }
     if (!texts.length) return decision
+
+    // A program only sees the value its sub-call returns, so a note appended to
+    // the content is written to a log nobody reads. Context is the channel that
+    // reaches the model for those calls, and it survives a replaced value.
+    if (exec?.parent !== undefined) {
+      const carried = Array.isArray(decision.additionalContexts) ? decision.additionalContexts : []
+      return { ...decision, additionalContexts: [...carried, ...asContext(texts)] }
+    }
+
+    // Replacing the value rebuilds the content, so text cannot ride along.
+    if (Object.hasOwn(decision, 'value')) return decision
+    const base = Array.isArray(decision.content) ? decision.content : result?.content
+    if (!Array.isArray(base)) return decision
 
     return {
       ...decision,
