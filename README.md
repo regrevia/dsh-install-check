@@ -1,3 +1,5 @@
+> 已并入 `dsh-crash-lore` 0.3.0，作为 `config.installCheck` 开关的模块一起发布；独立版停在 0.2.1，不再单独更新。
+
 # dsh-install-check
 
 中文名：**插件无忧装**
