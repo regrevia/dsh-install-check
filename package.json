@@ -1,6 +1,6 @@
 {
   "name": "dsh-install-check",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": false,
   "type": "module",
   "description": "Looks at a plugin before it lands: name collisions and missing plugin dependencies, stated as one short sentence and one suggestion.",
