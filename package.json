@@ -1,9 +1,9 @@
 {
   "name": "dsh-install-check",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": false,
   "type": "module",
-  "description": "Looks at a plugin before it lands: name collisions and missing plugin dependencies, stated as one short sentence and one suggestion.",
+  "description": "Stopped: merged into dsh-safeguard. It looked at a plugin before it landed - name collisions and missing plugin dependencies - one short sentence and one suggestion.",
   "keywords": [
     "dsh",
     "dsh-plugin",

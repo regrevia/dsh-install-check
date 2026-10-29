@@ -1,4 +1,5 @@
-> 已并入 `dsh-crash-lore` 0.3.0，作为 `config.installCheck` 开关的模块一起发布；独立版停在 0.2.1，不再单独更新。
+> **已停止更新。** 功能已合并进 [`dsh-safeguard`](https://github.com/regrevia/dsh-safeguard)（由 `dsh-crash-lore` 改名而来；装插件前的冲突体检是它的 `config.installCheck` 模块）。
+> 这个独立版停在 0.2.1，仓库只为旧链接保留，新问题请提到 `dsh-safeguard`。
 
 # dsh-install-check
 
